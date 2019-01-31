@@ -59,6 +59,7 @@
                                [#%lambda lambda]
                                [#%lambda λ]
                                [#%App App]
+                               [#%Lambda Lambda]
                                [sysf:+ +]
                                [sysf:unit unit]
                                [sysf:println println]))
@@ -229,10 +230,13 @@
         #:literal-sets [core-type-literals]
         #:datum-literals [:]
         [[actual-x:type-var-id expected-x:type-var-id]
-         #:when (eq? (free-id-table-ref ctx #'actual-x) (free-id-table-ref ctx #'expected-x))
+         #:when (free-identifier=? #'actual-x #'expected-x)
          (void)]
         [[actual-x:type-constructor-id expected-x:type-constructor-id]
          #:when (free-identifier=? #'actual-x #'expected-x)
+         (void)]
+        [[actual-x:id expected-x:id]
+         #:when (eq? (free-id-table-ref ctx #'actual-x) (free-id-table-ref ctx #'expected-x))
          (void)]
         [[(#%type:app actual-t1:type actual-t2:type) (#%type:app expected-t1:type expected-t2:type)]
          #:when (and (loop #'actual-t1 #'expected-t1 ctx)
@@ -457,6 +461,16 @@
                            this-syntax
                            this-syntax)
             instantiated-t)]
+      [(head:#%Lambda ~! [{~type x:id} : {~type k:type}] e:expr)
+       #:do [(define sc* (make-expression-scope sc))
+             (define k- (e+t-e/t=! (expand-type #'k sc) #'Type #:src #'k))
+             (define x- (scope-bind! sc* #'x (type-var k-)))
+             (match-define (e+t e- e-t) (expand-expr (in-scope sc* #'e) sc*))]
+       (e+t (datum->syntax this-syntax
+                           (list #'head (list x- ': k-) e-)
+                           this-syntax
+                           this-syntax)
+            #`(#%forall [#,x- : #,k-] #,e-t))]
       [(#%case ~! . _)
        (error "not implemented yet")]
       [(_ . _)
@@ -559,6 +573,11 @@
        [(#%App ~! e:expr t:type)
         #`(let-values ([() (begin (lambda () #,(system-f-type->residual-racket-expr #'t)) (values))])
             #,(system-f-expr->racket-expr #'e))]
+       [(#%Lambda ~! [x:id : k:type] e:expr)
+        (~> #`(let-values ([() (begin (lambda () #,(system-f-type->residual-racket-expr #'k))
+                                      (values))])
+                #,(system-f-expr->racket-expr #'e))
+            (syntax-property 'disappeared-binding (syntax-local-introduce #'x)))]
        [_
         (raise-syntax-error
          'system-f
