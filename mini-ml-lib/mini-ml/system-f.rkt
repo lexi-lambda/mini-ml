@@ -26,6 +26,7 @@
 
 (require (for-meta 2 racket/base
                      racket/syntax
+                     syntax/parse/class/struct-id
                      "private/util/stx.rkt")
          (for-syntax racket/base
                      racket/contract
@@ -164,38 +165,43 @@
 ; identifiers bound to instances of the struct.
 
 (begin-for-syntax
-  (define-simple-macro (define-syntax-info name:id [field:id ...]
+  (define-simple-macro (define-syntax-info name:id {~optional super-name:struct-id} [field:id ...]
                          {~alt {~optional {~seq #:name err-name:expr}
                                           #:defaults ([err-name #`'#,(symbol->string
                                                                       (syntax-e #'name))])}
-                               {~seq #:property prop:expr prop-val:expr}}
+                               {~seq #:property prop:expr prop-val:expr}
+                               {~optional {~and #:abstract abstract?}}}
                          ...)
+    #:fail-when (and (attribute super-name)
+                     (not (attribute super-name.all-fields-visible?))
+                     #'super-name)
+    "not all fields visible in supertype"
     #:with name-id (derived-id "" #'name "-id")
     #:with name? (format-id #'name "~a?" #'name)
-    #:with [field-tmp ...] (generate-temporaries (attribute field))
+    #:with [every-field ...] (append (or (attribute super-name.accessor-id) '()) (attribute field))
+    #:with [field-tmp ...] (generate-temporaries (attribute every-field))
+    #:attr ctor-id (and (attribute abstract?) (generate-temporary #'name))
     (begin
-      (struct name [field ...]
+      (struct name {~? super-name} [field ...]
+        {~? {~@ #:constructor-name ctor-id}}
         {~@ #:property prop prop-val} ...)
       (define-syntax-class (name-id [sc #f])
         #:description #f
         #:commit
-        #:attributes [value field ...]
+        #:attributes [value every-field ...]
         [pattern {~var x (local-value name? (and sc (scope-defctx sc)) #:name err-name)}
                  #:attr value (attribute x.local-value)
                  #:do [(match-define (struct name [field-tmp ...]) (attribute value))]
-                 {~@ #:attr field field-tmp} ...])))
+                 {~@ #:attr every-field field-tmp} ...])))
 
   ; Variables, type variables, and type constructors are really just special bindings with a type or
   ; kind attached. Primitives are variables that are actually bound to something when extraction to
   ; Racket happens, instead of being locally-bound.
-  (define-syntax-info var (type) #:name "variable")
+  (define-syntax-info var (type) #:abstract #:name "variable")
+  (define-syntax-info local-var var () #:name "variable")
+  (define-syntax-info module-var var (racket-id) #:name "variable")
   (define-syntax-info type-var (kind) #:name "type variable")
-  (define-syntax-info type-constructor (kind) #:name "type constructor")
-
-  (struct primitive var (racket-id)
-    #:property prop:procedure
-    (lambda (v stx)
-      ((set!-transformer-procedure (make-variable-like-transformer (primitive-racket-id v))) stx))))
+  (define-syntax-info type-constructor (kind) #:name "type constructor"))
 
 ;; ---------------------------------------------------------------------------------------------------
 ;; type operations
@@ -315,7 +321,7 @@
              #:datum-literals [:]
              [(head:#%define ~! x:id : {~type t:type} e:expr)
               #:do [(define t- (e+t-e/t=! (expand-type #'t #f) #'Type #:src #'t))
-                    (define x- (scope-bind! sc #'x (var t-)))]
+                    (define x- (scope-bind! sc #'x (local-var t-)))]
               (loop stxs-to-go* (cons (datum->syntax this-syntax
                                                      (list #'head x- ': t- #'e)
                                                      this-syntax
@@ -430,7 +436,7 @@
       [(head:#%lambda ~! [x:id : {~type t:type}] e:expr)
        #:do [(define sc* (make-expression-scope sc))
              (define t- (e+t-e/t=! (expand-type #'t sc) #'Type #:src #'t))
-             (define x- (scope-bind! sc* #'x (var t-)))
+             (define x- (scope-bind! sc* #'x (local-var t-)))
              (match-define (e+t e- e-t) (expand-expr (in-scope sc* #'e) sc*))]
        (e+t (datum->syntax this-syntax
                            (list #'head (list x- ': t-) e-)
@@ -572,6 +578,8 @@
      (syntax-parse stx
        #:literal-sets [core-expr-literals]
        #:datum-literals [:]
+       [x:module-var-id
+        (attribute x.racket-id)]
        [_:id
         this-syntax]
        [(#%system-f:datum ~! lit:system-f-literal)
@@ -684,7 +692,7 @@
 (define-syntax-parser define-system-f-primitive
   [(_ x:id : t:type racket-id:id)
    #'(define-syntax x
-       (primitive
+       (module-var
         (e+t-e/t=! (expand-type #'t #f) #'Type #:src (quote-syntax t))
         #'racket-id))])
 
