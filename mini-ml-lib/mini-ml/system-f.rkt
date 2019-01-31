@@ -530,6 +530,18 @@
 ;; ---------------------------------------------------------------------------------------------------
 ;; extraction
 
+; To help Check Syntax, it’s useful to sometimes leave behind “residual” expressions that will never
+; be evaluated (and can therefore be totally optimized away by the compiler) that preserve some of the
+; binding structure of the original program. To ensure that they can be optimized away, this macro
+; wraps them in a lambda that can never be called and returns zero values.
+(define-simple-macro (residual e:expr)
+  (#%expression (begin (lambda () e) (values))))
+
+(define-simple-macro (with-residual [residual-e:expr ...] e:expr)
+  (let-values ([() (residual residual-e)] ...) e))
+(define-simple-macro (define-residual residual-e:expr ...)
+  (begin (define-values [] (residual residual-e)) ...))
+
 (begin-for-syntax
   (define current-is-reexpanding?-id (make-parameter #f))
 
@@ -540,8 +552,7 @@
        #:datum-literals [:]
        [(#%define ~! x:id : t:type e:expr)
         #`(begin
-            (define-values []
-              (begin (lambda () #,(system-f-type->residual-racket-expr #'t)) (values)))
+            (define-residual #,(system-f-type->residual-racket-expr #'t))
             (define x #,(system-f-expr->racket-expr #'e)))]
        [(#%define-syntax ~! x:id e)
         #`(define-syntax x (if #,(current-is-reexpanding?-id) #f e))]
@@ -568,14 +579,13 @@
        [(#%system-f:app ~! f:expr e:expr)
         #`(#%plain-app #,(system-f-expr->racket-expr #'f) #,(system-f-expr->racket-expr #'e))]
        [(#%lambda ~! [x:id : t:type] e:expr)
-        #`(let-values ([() (begin (lambda () #,(system-f-type->residual-racket-expr #'t)) (values))])
+        #`(with-residual [#,(system-f-type->residual-racket-expr #'t)]
             (#%plain-lambda [x] #,(system-f-expr->racket-expr #'e)))]
        [(#%App ~! e:expr t:type)
-        #`(let-values ([() (begin (lambda () #,(system-f-type->residual-racket-expr #'t)) (values))])
+        #`(with-residual [#,(system-f-type->residual-racket-expr #'t)]
             #,(system-f-expr->racket-expr #'e))]
        [(#%Lambda ~! [x:id : k:type] e:expr)
-        (~> #`(let-values ([() (begin (lambda () #,(system-f-type->residual-racket-expr #'k))
-                                      (values))])
+        (~> #`(with-residual [#,(system-f-type->residual-racket-expr #'k)]
                 #,(system-f-expr->racket-expr #'e))
             (syntax-property 'disappeared-binding (syntax-local-introduce #'x)))]
        [_
