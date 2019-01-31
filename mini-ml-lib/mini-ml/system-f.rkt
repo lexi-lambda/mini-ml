@@ -591,7 +591,7 @@
        #:literal-sets [core-type-literals]
        #:datum-literals [:]
        [x:id
-        #''x]
+        #'(record-use x)]
        [(#%type:app ~! t1:type t2:type)
         #`(#%plain-app #,(system-f-type->residual-racket-expr #'t1)
                        #,(system-f-type->residual-racket-expr #'t2))]
@@ -607,6 +607,15 @@
       [(#%define-syntax ~! _:id _) #t]
       [(#%begin-for-syntax ~! _ ...) #t]
       [_ #f])))
+
+; Expanding directly to an identifier with a 'disappeared-use property when generating residual
+; expressions from types causes problems for type variables bound by `#%forall`, since when the
+; residual `#%plain-lambda` expressions get expanded by the Racket expander, the variable acquires
+; an extra scope that won’t be in the property. By delaying the introduction of the property, the
+; identifier will properly acquire the extra scope before being moved into the property.
+(define-syntax-parser record-use
+  [(_ x:id)
+   (syntax-property #''x 'disappeared-use (syntax-local-introduce #'x))])
 
 ; Defer to a secondary #%module-begin form to establish a lift target for requires (lifts are not
 ; legal in a 'module-begin context).
