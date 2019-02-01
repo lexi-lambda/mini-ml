@@ -38,7 +38,6 @@
                      syntax/id-table
                      syntax/parse/class/local-value
                      syntax/parse/define
-                     syntax/transformer
                      syntax-generic2
                      threading
                      "private/util/stx.rkt")
@@ -199,8 +198,8 @@
                  {~@ #:attr every-field field-tmp} ...])))
 
   ; Variables, type variables, and type constructors are really just special bindings with a type or
-  ; kind attached. Primitives are variables that are actually bound to something when extraction to
-  ; Racket happens, instead of being locally-bound.
+  ; kind attached. Module-level runtime variables also have an associated Racket binding, for use
+  ; during program extraction.
   (define-syntax-info var (type) #:abstract #:name "variable")
   (define-syntax-info local-var var () #:name "variable")
   (define-syntax-info module-var var (racket-id) #:name "variable")
