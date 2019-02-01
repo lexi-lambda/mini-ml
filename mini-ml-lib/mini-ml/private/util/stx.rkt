@@ -5,7 +5,16 @@
          syntax/parse
          threading)
 
-(provide (contract-out [syntax-armed? (-> syntax? boolean?)]
+(provide (contract-out [module-path-syntax? (-> syntax? boolean?)]
+                       [module-path-submodule (->i ([mod-path (or/c module-path? module-path-syntax?)]
+                                                    [submod-name (mod-path)
+                                                                 (if (syntax? mod-path)
+                                                                     (or/c symbol? identifier?)
+                                                                     symbol?)])
+                                                   [result (mod-path) (if (syntax? mod-path)
+                                                                          module-path-syntax?
+                                                                          module-path?)])]
+                       [syntax-armed? (-> syntax? boolean?)]
                        [call-with-disarmed-syntax (->* [(and/c syntax? (not/c syntax-tainted?))
                                                         (-> (and/c syntax? (not/c syntax-armed?))
                                                             (and/c syntax? (not/c syntax-tainted?)))]
@@ -20,6 +29,35 @@
                        [derived-id (-> string? syntax? string? syntax?)]
                        [macro-track-origin (->* [syntax? syntax?] [#:flip-scopes? any/c] syntax?)]
                        [introduce-everywhere (-> syntax? (-> syntax? syntax?) syntax?)]))
+
+;; ---------------------------------------------------------------------------------------------------
+;; module paths
+
+(define (module-path-syntax? stx)
+  (and (syntax? stx) (module-path? (syntax->datum stx))))
+
+(define (module-path-submodule base-path submod-name)
+  (if (syntax? base-path)
+      (syntax-parse base-path
+        #:context 'module-path-submodule
+        #:datum-literals [submod]
+        [(head:submod ~! more ...)
+         (datum->syntax this-syntax
+                        `(,#'head ,@(attribute more) ,(datum->syntax #f submod-name))
+                        this-syntax
+                        this-syntax)]
+        [_
+         (datum->syntax this-syntax
+                        (list (datum->syntax #'here 'submod)
+                              this-syntax
+                              (datum->syntax #f submod-name))
+                        this-syntax
+                        this-syntax)])
+      (match base-path
+        [(cons 'submod more)
+         `(submod ,@more ,submod-name)]
+        [_
+         `(submod ,base-path ,submod-name)])))
 
 ;; ---------------------------------------------------------------------------------------------------
 ;; taints

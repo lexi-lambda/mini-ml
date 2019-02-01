@@ -52,7 +52,8 @@
 (define-namespace type #:unique)
 
 (provide/namespace namespace:value
-                   (rename-out [#%define define]
+                   (rename-out [#%require require]
+                               [#%define define]
                                [#%define-syntax define-syntax]
                                [#%define-main define-main]
                                [#%begin begin]
@@ -152,9 +153,11 @@
       (define-literal-set class.-literals [x ...]) ...)))
 
 (define-keywords
-  (decl [#%define #%define-syntax #%define-type #%define-main #%begin #%begin-for-syntax])
+  (decl [#%require #%provide #%define #%define-syntax #%define-type #%define-main #%begin
+                   #%begin-for-syntax])
   (expr [#%system-f:datum #%lambda #%system-f:app #%Lambda #%App #%case])
-  (type [#%type:app #%forall]))
+  (type [#%type:app #%forall])
+  (require-spec [#%binding #%union]))
 
 ;; ---------------------------------------------------------------------------------------------------
 ;; `define-syntax-info`
@@ -270,9 +273,16 @@
     (define msg (string-append "not a valid " thing))
     (lambda (stx) (raise-syntax-error 'system-f msg stx)))
 
+  (define pair-only
+    (syntax-parser
+      [(x:id . _) #'x]
+      [_ #f]))
+
   (define-syntax-generic system-f-decl (system-f-fallback "declaration"))
   (define-syntax-generic system-f-expr (system-f-fallback "expression"))
   (define-syntax-generic system-f-type (system-f-fallback "type"))
+  (define-syntax-generic system-f-require-spec (system-f-fallback "require spec")
+    #:dispatch-on pair-only)
 
   ; `make-variable-like-transformer` is an awkward way to solve a common problem: wanting a macro that
   ; only ever expands as a single identifier, not at the head of a list. Let’s try just baking that
@@ -319,6 +329,24 @@
            (syntax-parse stx
              #:literal-sets [core-decl-literals]
              #:datum-literals [:]
+             [(head:#%require ~! rs ...)
+              #:with [expanded-rs ...] (append-map (lambda (rs) (expand-system-f-require-spec rs sc))
+                                                   (attribute rs))
+              #:with [racket-rs ...] (map system-f-require-spec->racket-require-spec
+                                          (attribute expanded-rs))
+              #:do [(define-values [stxs-to-go** stxs-deferred*]
+                      (for/fold ([stxs-to-go** stxs-to-go*]
+                                 [stxs-deferred* stxs-deferred])
+                                ([racket-rs (in-list (attribute racket-rs))])
+                        (define rsc (make-require-scope! racket-rs #:origin this-syntax))
+                        (define (rsc-introduce stx) (require-scope-introduce rsc stx))
+                        (values (map rsc-introduce stxs-to-go**)
+                                (map rsc-introduce stxs-deferred*))))]
+              (loop stxs-to-go** (cons (datum->syntax this-syntax
+                                                      (cons #'head (attribute expanded-rs))
+                                                      this-syntax
+                                                      this-syntax)
+                                       stxs-deferred*))]
              [(head:#%define ~! x:id : {~type t:type} e:expr)
               #:do [(define t- (e+t-e/t=! (expand-type #'t #f) #'Type #:src #'t))
                     (define x- (scope-bind! sc #'x (local-var t-)))]
@@ -365,6 +393,9 @@
           (syntax-parse stx
             #:literal-sets [core-decl-literals]
             #:datum-literals [:]
+            [(#%require ~! . _)
+             ; already handled in first pass
+             (values (cons this-syntax expanded-decls) main-decls)]
             [(head:#%define ~! x:id : t:type e:expr)
              #:do [(define e- (e+t-e/t=! (expand-expr #'e sc) #'t #:src #'e))]
              (values (cons (datum->syntax this-syntax
@@ -531,7 +562,90 @@
                              this-syntax))]
       [_
        (recur (macro-track-origin (apply-as-transformer system-f-type sc this-syntax)
-                                  this-syntax))])))
+                                  this-syntax))]))
+
+  (define-syntax-class phase-level
+    #:description "phase level"
+    #:commit
+    #:attributes []
+    [pattern _:exact-integer]
+    [pattern #f])
+
+  (define-syntax-class relative-path-string
+    #:description "relative path string"
+    #:commit
+    #:opaque
+    #:attributes []
+    [pattern s:string #:when (relative-path? (syntax-e #'s))])
+
+  (define-syntax-class literal-path
+    #:description "literal path"
+    #:commit
+    #:opaque
+    #:attributes []
+    [pattern v #:when (path? (syntax-e #'v))])
+
+  (define-syntax-class root-module-path
+    #:description "root module path"
+    #:commit
+    #:attributes []
+    #:datum-literals [quote lib file]
+    [pattern (quote ~! _:id)]
+    [pattern _:relative-path-string]
+    [pattern (lib ~! _:relative-path-string ...+)]
+    [pattern (file ~! _:string)]
+    [pattern _:id]
+    [pattern _:literal-path])
+
+  (define-syntax-class module-path
+    #:description "module path"
+    #:commit
+    #:attributes []
+    #:datum-literals [submod]
+    [pattern _:root-module-path]
+    [pattern (submod ~! {~or _:root-module-path "." ".."} _:id ...+)])
+
+  (define (calculate-phase-shift new-phase orig-phase)
+    (and new-phase orig-phase (- new-phase orig-phase)))
+
+  (define (expand-system-f-require-spec stx sc)
+    (define (recur stx) (expand-system-f-require-spec stx sc))
+    (syntax-parse stx
+      #:literal-sets [core-require-spec-literals]
+      #:datum-literals [=>]
+      [mod-path:module-path
+       #:and ~!
+       #:do [(define nss (module-exported-namespaces (syntax->datum #'mod-path)))]
+       (for*/list ([ns (in-list (cons #f (set->list nss)))]
+                   [ns-mod-path (in-value (if ns
+                                              (namespace-exports-submodule-path #'mod-path ns)
+                                              #'mod-path))]
+                   [exports (in-list (syntax-local-module-exports ns-mod-path))]
+                   [phase (in-value (car exports))]
+                   [external-sym (in-list (cdr exports))])
+         (define internal-id (datum->syntax this-syntax external-sym this-syntax this-syntax))
+         (define ns-internal-id (if ns (in-namespace ns internal-id) internal-id))
+         (macro-track-origin
+          (datum->syntax #f
+                         (list (datum->syntax #'here '#%binding)
+                               #'mod-path '#:in (and ns (namespace-key ns))
+                               (list external-sym '#:at phase '=> ns-internal-id '#:at 0)))
+          this-syntax))]
+      [(#%binding ~! mod-path:module-path #:in {~or ns-key:id #f}
+                  [external-id:id #:at external-phase:phase-level
+                                  => internal-id:id #:at internal-phase:phase-level])
+       (list this-syntax)]
+      [(#%union ~! rs ...)
+       (for*/list ([rs (in-list (attribute rs))]
+                   [expanded-rs (in-list (recur rs))])
+         (macro-track-origin expanded-rs this-syntax))]
+      [_
+       (expand-system-f-require-spec
+        (macro-track-origin (apply-as-transformer system-f-require-spec sc this-syntax)
+                            this-syntax))]))
+
+  (define (local-expand-system-f-require-spec stx [sc #f])
+    (datum->syntax stx (expand-system-f-require-spec stx sc) stx stx)))
 
 ;; ---------------------------------------------------------------------------------------------------
 ;; extraction
@@ -548,6 +662,15 @@
 (define-simple-macro (define-residual residual-e:expr ...)
   (begin (define-values [] (residual residual-e)) ...))
 
+; Expanding directly to an identifier with a 'disappeared-use property when generating residual
+; expressions from types causes problems for type variables bound by `#%forall`, since when the
+; residual `#%plain-lambda` expressions get expanded by the Racket expander, the variable acquires
+; an extra scope that won’t be in the property. By delaying the introduction of the property, the
+; identifier will properly acquire the extra scope before being moved into the property.
+(define-syntax-parser record-use
+  [(_ x:id)
+   (syntax-property #''x 'disappeared-use (syntax-local-introduce #'x))])
+
 (begin-for-syntax
   (define current-is-reexpanding?-id (make-parameter #f))
 
@@ -556,6 +679,9 @@
      (syntax-parse stx
        #:literal-sets [core-decl-literals]
        #:datum-literals [:]
+       [(#%require ~! . _)
+        ; requires are lifted during expansion, so we don’t need to do anything with them here
+        #'(begin)]
        [(#%define ~! x:id : t:type e:expr)
         #`(begin
             (define-residual #,(system-f-type->residual-racket-expr #'t))
@@ -619,21 +745,34 @@
                           #,(system-f-type->residual-racket-expr #'t))])
      stx))
 
-  (define system-f-syntax-decl?
+  (define (system-f-require-spec->racket-require-spec stx)
+    (macro-track-origin
+     (syntax-parse stx
+       [(#%binding ~! mod-path:module-path #:in {~or ns-key:id #f}
+                   [external-id:id #:at external-phase:phase-level
+                                   => internal-id:id #:at internal-phase:phase-level])
+        #:with adjusted-mod-path (if (attribute ns-key)
+                                     (let ([ns (make-namespace (syntax-e #'ns-key))])
+                                       (namespace-exports-submodule-path #'mod-path ns))
+                                     #'mod-path)
+        #:with phase-shift (calculate-phase-shift (syntax-e #'internal-phase)
+                                                  (syntax-e #'external-phase))
+        #:with rename-spec #'(rename adjusted-mod-path internal-id external-id)
+        #`(just-meta external-phase #,(if (zero? (syntax-e #'phase-shift))
+                                          #'rename-spec
+                                          #'(for-meta phase-shift rename-spec)))]
+       [_
+        (raise-syntax-error
+         'system-f
+         "internal error: unexpected require spec found during extraction to racket"
+         this-syntax)])
+     stx))
+
+  (define system-f-debug-print-decl?
     (syntax-parser
       #:literal-sets [core-decl-literals]
-      [(#%define-syntax ~! _:id _) #t]
-      [(#%begin-for-syntax ~! _ ...) #t]
-      [_ #f])))
-
-; Expanding directly to an identifier with a 'disappeared-use property when generating residual
-; expressions from types causes problems for type variables bound by `#%forall`, since when the
-; residual `#%plain-lambda` expressions get expanded by the Racket expander, the variable acquires
-; an extra scope that won’t be in the property. By delaying the introduction of the property, the
-; identifier will properly acquire the extra scope before being moved into the property.
-(define-syntax-parser record-use
-  [(_ x:id)
-   (syntax-property #''x 'disappeared-use (syntax-local-introduce #'x))])
+      [({~or #%require #%define-syntax #%begin-for-syntax} ~! . _) #f]
+      [_ #t])))
 
 ; Defer to a secondary #%module-begin form to establish a lift target for requires (lifts are not
 ; legal in a 'module-begin context).
@@ -642,24 +781,19 @@
    #'(#%plain-module-begin (#%system-f:inner-module-begin decl ...))])
 
 (define-syntax-parser #%system-f:inner-module-begin
-  [(_ lang-mod-path-stx decl ...)
-   #:do [(define lang-mod-path (syntax->datum #'lang-mod-path-stx))
-         (define lang-nss (module-exported-namespaces lang-mod-path))
+  [(_ lang-mod-path decl ...)
+   #:do [(define lang-nss (module-exported-namespaces (syntax->datum #'lang-mod-path)))
          (define ns-rscs (for/list ([ns (in-set lang-nss)])
                            (make-require-scope!
-                            (datum->syntax (in-namespace ns #'lang-mod-path-stx)
-                                           (collapse-module-path
-                                            `(submod "." ,(namespace-exports-submodule-name ns))
-                                            lang-mod-path)
-                                           #'lang-mod-path-stx
-                                           #'lang-mod-path-stx))))]
+                            (~>> (namespace-exports-submodule-path #'lang-mod-path ns)
+                                 (in-namespace ns)))))]
    #:with [namespaced-decl ...] (for/fold ([decls (in-value-namespace #'[decl ...])])
                                           ([ns-rsc (in-list ns-rscs)])
                                   (require-scope-introduce ns-rsc decls 'add))
    #:with [expanded-decl ...] (expand-module (attribute namespaced-decl))
    #:do [(println (syntax-local-introduce
                    #`(#%system-f:module-begin
-                      #,@(filter-not system-f-syntax-decl? (attribute expanded-decl)))))]
+                      #,@(filter system-f-debug-print-decl? (attribute expanded-decl)))))]
    #:with is-reexpanding?-id (generate-temporary 'is-reexpanding?)
    #:with [racket-decl ...] (parameterize ([current-is-reexpanding?-id #'is-reexpanding?-id])
                               (map system-f-decl->racket-decl (attribute expanded-decl)))

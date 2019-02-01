@@ -12,7 +12,7 @@
 ; coexist, even in the same scope, so long as they are in separate namespaces:
 ;
 ;   (define (Foo [x : Integer] [y : String])
-;     (Tuple (* x 2) y)
+;     (Tuple (* x 2) y))
 ;
 ;   (define-type Foo (Tuple Integer String))
 ;
@@ -56,8 +56,14 @@
 (begin-for-syntax
   (provide (contract-out
             [make-namespace (-> symbol? namespace?)]
+            [namespace-key (-> namespace? symbol?)]
             [in-namespace (-> namespace? syntax? syntax?)]
             [namespace-exports-submodule-name (-> namespace? symbol?)]
+            [namespace-exports-submodule-path (->i ([mod-path (or/c module-path? module-path-syntax?)]
+                                                    [ns namespace?])
+                                                   [result (mod-path) (if (syntax? mod-path)
+                                                                          module-path-syntax?
+                                                                          module-path?)])]
             [module-exported-namespaces (-> module-path? (set/c #:cmp 'equal namespace?))])))
 
 ;; ---------------------------------------------------------------------------------------------------
@@ -213,6 +219,9 @@
   ; Returns the name of the submodule used to provide exported bindings in the given namespace.
   (define (namespace-exports-submodule-name ns)
     (format-symbol "~a-exports" (namespace-key ns)))
+
+  (define (namespace-exports-submodule-path base-mod-path ns)
+    (module-path-submodule base-mod-path (namespace-exports-submodule-name ns)))
 
   ; namespace->expression : namespace? -> syntax?
   ;
