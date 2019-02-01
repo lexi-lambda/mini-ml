@@ -46,7 +46,6 @@
                      racket/random
                      racket/set
                      racket/syntax
-                     syntax/modcollapse
                      syntax/parse/define
                      "util/stx.rkt")
          syntax/parse/define)
@@ -58,6 +57,7 @@
             [make-namespace (-> symbol? namespace?)]
             [namespace-key (-> namespace? symbol?)]
             [in-namespace (-> namespace? syntax? syntax?)]
+            [namespace->expression (-> namespace? syntax?)]
             [namespace-exports-submodule-name (-> namespace? symbol?)]
             [namespace-exports-submodule-path (->i ([mod-path (or/c module-path? module-path-syntax?)]
                                                     [ns namespace?])
@@ -238,8 +238,7 @@
     (unless (module-declared? mod-path #t)
       (raise-arguments-error 'module-exported-namespaces "submodule does not exist"
                              "module path" mod-path))
-    (define exported-namespaces-mod-path (collapse-module-path '(submod "." exported-namespaces)
-                                                               mod-path))
+    (define exported-namespaces-mod-path (module-path-submodule mod-path 'exported-namespaces))
     (if (module-declared? exported-namespaces-mod-path #t)
         (dynamic-require exported-namespaces-mod-path 'exported-namespaces)
         (set))))

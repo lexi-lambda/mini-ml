@@ -36,7 +36,6 @@
                      racket/set
                      racket/syntax
                      syntax/id-table
-                     syntax/modcollapse
                      syntax/parse/class/local-value
                      syntax/parse/define
                      syntax/transformer
@@ -53,6 +52,7 @@
 
 (provide/namespace namespace:value
                    (rename-out [#%require require]
+                               [#%provide provide]
                                [#%define define]
                                [#%define-syntax define-syntax]
                                [#%define-main define-main]
@@ -157,7 +157,8 @@
                    #%begin-for-syntax])
   (expr [#%system-f:datum #%lambda #%system-f:app #%Lambda #%App #%case])
   (type [#%type:app #%forall])
-  (require-spec [#%binding #%union]))
+  (require-spec [#%binding #%union])
+  (provide-spec [#%binding #%union]))
 
 ;; ---------------------------------------------------------------------------------------------------
 ;; `define-syntax-info`
@@ -283,6 +284,8 @@
   (define-syntax-generic system-f-type (system-f-fallback "type"))
   (define-syntax-generic system-f-require-spec (system-f-fallback "require spec")
     #:dispatch-on pair-only)
+  (define-syntax-generic system-f-provide-spec (system-f-fallback "provide spec")
+    #:dispatch-on pair-only)
 
   ; `make-variable-like-transformer` is an awkward way to solve a common problem: wanting a macro that
   ; only ever expands as a single identifier, not at the head of a list. Let’s try just baking that
@@ -377,7 +380,7 @@
              [({~or #%define-type #%begin-for-syntax}
                ~! . _)
               (error "not yet implemented")]
-             [({~or #;#%provide #%define-main} ~! . _)
+             [({~or #%provide #%define-main} ~! . _)
               (loop stxs-to-go* (cons this-syntax stxs-deferred))]
              [_
               (loop (cons (macro-track-origin (apply-as-transformer system-f-decl sc this-syntax)
@@ -396,6 +399,15 @@
             [(#%require ~! . _)
              ; already handled in first pass
              (values (cons this-syntax expanded-decls) main-decls)]
+            [(head:#%provide ~! ps ...)
+             #:do [(define expanded-pss (append-map (lambda (ps) (expand-system-f-provide-spec ps sc))
+                                                    (attribute ps)))]
+             (values (cons (datum->syntax this-syntax
+                                          (cons #'head expanded-pss)
+                                          this-syntax
+                                          this-syntax)
+                           expanded-decls)
+                     main-decls)]
             [(head:#%define ~! x:id : t:type e:expr)
              #:do [(define e- (e+t-e/t=! (expand-expr #'e sc) #'t #:src #'e))]
              (values (cons (datum->syntax this-syntax
@@ -608,6 +620,16 @@
   (define (calculate-phase-shift new-phase orig-phase)
     (and new-phase orig-phase (- new-phase orig-phase)))
 
+  (define-syntax-class require-#%binding
+    #:description #f
+    #:no-delimit-cut
+    #:attributes [external-id external-phase ns-key mod-path internal-id internal-phase]
+    #:literal-sets [core-require-spec-literals]
+    #:datum-literals [=>]
+    [pattern (#%binding ~! external-id:id #:at external-phase:phase-level
+                        #:from {~or ns-key:id #f} #:in mod-path:module-path
+                        => internal-id:id #:at internal-phase:phase-level)])
+
   (define (expand-system-f-require-spec stx sc)
     (define (recur stx) (expand-system-f-require-spec stx sc))
     (syntax-parse stx
@@ -625,30 +647,80 @@
                    [external-sym (in-list (cdr exports))])
          (define internal-id (datum->syntax this-syntax external-sym this-syntax this-syntax))
          (define ns-internal-id (if ns (in-namespace ns internal-id) internal-id))
-         (macro-track-origin
-          (datum->syntax #f
-                         (list (datum->syntax #'here '#%binding)
-                               #'mod-path '#:in (and ns (namespace-key ns))
-                               (list external-sym '#:at phase '=> ns-internal-id '#:at 0)))
-          this-syntax))]
-      [(#%binding ~! mod-path:module-path #:in {~or ns-key:id #f}
-                  [external-id:id #:at external-phase:phase-level
-                                  => internal-id:id #:at internal-phase:phase-level])
+         (datum->syntax #f
+                        (list (datum->syntax #'here '#%binding)
+                              external-sym '#:at phase
+                              '#:from (and ns (namespace-key ns)) '#:in #'mod-path
+                              '=> ns-internal-id '#:at 0)))]
+      [_:require-#%binding
        (list this-syntax)]
       [(#%union ~! rs ...)
        (for*/list ([rs (in-list (attribute rs))]
                    [expanded-rs (in-list (recur rs))])
          (macro-track-origin expanded-rs this-syntax))]
       [_
-       (expand-system-f-require-spec
-        (macro-track-origin (apply-as-transformer system-f-require-spec sc this-syntax)
-                            this-syntax))]))
+       (recur (macro-track-origin (apply-as-transformer system-f-require-spec sc this-syntax)
+                                  this-syntax))]))
 
   (define (local-expand-system-f-require-spec stx [sc #f])
-    (datum->syntax stx (expand-system-f-require-spec stx sc) stx stx)))
+    (datum->syntax #f (list (datum->syntax #'here '#%union) (expand-system-f-require-spec stx sc))))
+
+  (define-syntax-class provide-#%binding
+    #:description #f
+    #:no-delimit-cut
+    #:attributes [internal-id external-id phase ns-key]
+    #:literal-sets [core-provide-spec-literals]
+    #:datum-literals [=>]
+    [pattern (#%binding ~! internal-id:id => external-id:id
+                        #:at phase:phase-level #:in {~or ns-key:id #f})])
+
+  (define (expand-system-f-provide-spec stx sc)
+    (define (recur stx) (expand-system-f-provide-spec stx sc))
+    (syntax-parse stx
+      #:literal-sets [core-provide-spec-literals]
+      #:datum-literals [=>]
+      [x:id
+       (list (datum->syntax #f
+                            (list (datum->syntax #'here '#%binding)
+                                  #'x '=> #'x '#:at 0 '#:in (namespace-key namespace:value))))]
+      [_:provide-#%binding
+       (list this-syntax)]
+      [(#%union ~! ps ...)
+       (for*/list ([ps (in-list (attribute ps))]
+                   [expanded-ps (in-list (recur ps))])
+         (macro-track-origin expanded-ps this-syntax))]
+      [_
+       (recur (macro-track-origin (apply-as-transformer system-f-require-spec sc this-syntax)
+                                  this-syntax))]))
+
+  (define (local-expand-system-f-provide-spec stx [sc #f])
+    (datum->syntax #f (list (datum->syntax #'here '#%union) (expand-system-f-provide-spec stx sc)))))
 
 ;; ---------------------------------------------------------------------------------------------------
 ;; extraction
+
+; Once a module has been expanded to the System F core language, it needs to be translated into the
+; corresponding Racket code that can actually be executed. We call this process “extraction” — a
+; Racket program is “extracted” from the System F one. For the most part, this translation is
+; direct — System F declarations are mapped to Racket definitions, System F expressions are mapped to
+; Racket expressions, etc. — but there are some subtleties involved along the way.
+;
+; One such subtlety is the handling of typed bindings. System F types are erased, so the extracted
+; Racket program does not include types, but what about provided bindings? If one System F module
+; imports another, then it needs to know the type of each binding in order to ensure its use is
+; well-typed. Therefore, each System F `#%define` is actually translated into two Racket definitions:
+; one using `define` and another using `define-syntax`. The `define` binding is bound to the actual
+; extracted Racket expression, while the `define-syntax` binding is bound to a `module-var` that
+; references the `define` binding.
+;
+; The main subtlety in the above approach is ensuring the right bindings are referenced in the right
+; places. Extracted expressions should refer to the `define` binding, since they are already
+; typechecked and ought to refer to the ordinary Racket variable, but references inside `#%provide`
+; declarations ought to refer to the `define-syntax` binding so that importing modules can access the
+; type information. The solution is to use the same identifier for both bindings, but to add a fresh
+; scope to the `define` bindings to make them distinct. The same scope is added to the extracted
+; right-hand side of each `#%define` declaration, but nowhere else, which redirects exactly the
+; appropriate references.
 
 ; To help Check Syntax, it’s useful to sometimes leave behind “residual” expressions that will never
 ; be evaluated (and can therefore be totally optimized away by the compiler) that preserve some of the
@@ -674,7 +746,7 @@
 (begin-for-syntax
   (define current-is-reexpanding?-id (make-parameter #f))
 
-  (define (system-f-decl->racket-decl stx)
+  (define (system-f-decl->racket-decl stx internal-introduce)
     (macro-track-origin
      (syntax-parse stx
        #:literal-sets [core-decl-literals]
@@ -682,16 +754,20 @@
        [(#%require ~! . _)
         ; requires are lifted during expansion, so we don’t need to do anything with them here
         #'(begin)]
+       [(#%provide ~! ps ...)
+        #`(begin #,@(map system-f-provide-spec->racket-decl (attribute ps)))]
        [(#%define ~! x:id : t:type e:expr)
+        #:with internal-x (internal-introduce #'x)
         #`(begin
             (define-residual #,(system-f-type->residual-racket-expr #'t))
-            (define x #,(system-f-expr->racket-expr #'e)))]
+            (define internal-x #,(system-f-expr->racket-expr (internal-introduce #'e)))
+            (define-syntax x (module-var (quote-syntax t) #'internal-x)))]
        [(#%define-syntax ~! x:id e)
         #`(define-syntax x (if #,(current-is-reexpanding?-id) #f e))]
        [(#%define-main ~! e:expr)
         #`(module* main #f
             (#%plain-module-begin
-             #,(system-f-expr->racket-expr #'e)))]
+             #,(system-f-expr->racket-expr (internal-introduce #'e))))]
        [_
         (raise-syntax-error
          'system-f
@@ -748,9 +824,7 @@
   (define (system-f-require-spec->racket-require-spec stx)
     (macro-track-origin
      (syntax-parse stx
-       [(#%binding ~! mod-path:module-path #:in {~or ns-key:id #f}
-                   [external-id:id #:at external-phase:phase-level
-                                   => internal-id:id #:at internal-phase:phase-level])
+       [:require-#%binding
         #:with adjusted-mod-path (if (attribute ns-key)
                                      (let ([ns (make-namespace (syntax-e #'ns-key))])
                                        (namespace-exports-submodule-path #'mod-path ns))
@@ -765,6 +839,22 @@
         (raise-syntax-error
          'system-f
          "internal error: unexpected require spec found during extraction to racket"
+         this-syntax)])
+     stx))
+
+  (define (system-f-provide-spec->racket-decl stx)
+    (macro-track-origin
+     (syntax-parse stx
+       [:provide-#%binding
+        #:do [(define ns (and (attribute ns-key) (make-namespace (syntax-e #'ns-key))))]
+        #:with racket-spec #'(for-meta phase (rename-out [internal-id external-id]))
+        (if (attribute ns-key)
+            #'(provide/namespace (make-namespace 'ns-key) racket-spec)
+            #'(provide racket-spec))]
+       [_
+        (raise-syntax-error
+         'system-f
+         "internal error: unexpected provide spec found during extraction to racket"
          this-syntax)])
      stx))
 
@@ -795,8 +885,12 @@
                    #`(#%system-f:module-begin
                       #,@(filter system-f-debug-print-decl? (attribute expanded-decl)))))]
    #:with is-reexpanding?-id (generate-temporary 'is-reexpanding?)
+   #:do [(define internal-introducer (make-syntax-introducer #t))
+         (define (internal-introduce stx)
+           (introduce-everywhere stx (lambda (stx) (internal-introducer stx 'add))))]
    #:with [racket-decl ...] (parameterize ([current-is-reexpanding?-id #'is-reexpanding?-id])
-                              (map system-f-decl->racket-decl (attribute expanded-decl)))
+                              (for/list ([expanded-decl (in-list (attribute expanded-decl))])
+                                (system-f-decl->racket-decl expanded-decl internal-introduce)))
    ; Add an extra scope to everything to “freshen” binders. The expander complains if an identifier
    ; bound by a module-level binding form has *exactly* the same scopes as an existing binding, since
    ; the new binding would conflict with the old one. By adding a new scope to everything, the
