@@ -162,47 +162,65 @@
 ;; ---------------------------------------------------------------------------------------------------
 ;; `define-syntax-info`
 
-; Sometimes, it’s really useful to just attach some compile-time metadata to an identifier directly
-; without having to deal with the dispatch machinery of syntax generics. `define-syntax-info` is a
-; macro to make that simple: it defines both a struct and a syntax class for matching against
-; identifiers bound to instances of the struct.
+; It’s common to want to attach compile-time information to an identifier, which is normally done
+; using a struct that holds the information, but this becomes awkward if a single identifier needs to
+; serve multiple meanings (such as, for example, a data constructor that serves as both a variable and
+; a pattern). The traditional approach is to use structure type properties, but this can be
+; cumbersome. Syntax generics make things easier, but they use dispatch machinery that makes them more
+; awkward than necessary to match on with syntax/parse.
+;
+; `define-syntax-info` is a thin wrapper around syntax generics to better serve the above use case.
+; The definitions are morally like structures, with fields containing data, but that data is actually
+; just stored in a closure inside a generic definition. Accessing the data is done via a syntax class,
+; which binds the fields as attributes.
 
 (begin-for-syntax
-  (define-simple-macro (define-syntax-info name:id {~optional super-name:struct-id} [field:id ...]
+  (define dispatch-on-id-only
+    (syntax-parser
+      [x:id #'x]
+      [_ #f]))
+
+  (define-simple-macro (define-syntax-info name:id [field:id ...]
                          {~alt {~optional {~seq #:name err-name:expr}
                                           #:defaults ([err-name #`'#,(symbol->string
                                                                       (syntax-e #'name))])}
-                               {~seq #:property prop:expr prop-val:expr}
-                               {~optional {~and #:abstract abstract?}}}
+                               {~optional {~seq #:constructor-name
+                                                {~or ctor-id:id {~and #f {~bind [omit-ctor? #t]}}}}}}
                          ...)
-    #:fail-when (and (attribute super-name)
-                     (not (attribute super-name.all-fields-visible?))
-                     #'super-name)
-    "not all fields visible in supertype"
-    #:with name-id (derived-id "" #'name "-id")
+    #:attr make-name (and (not (attribute omit-ctor?))
+                          (or (attribute ctor-id) (derived-id "make-" #'name "")))
     #:with name? (format-id #'name "~a?" #'name)
-    #:with [every-field ...] (append (or (attribute super-name.accessor-id) '()) (attribute field))
-    #:with [field-tmp ...] (generate-temporaries (attribute every-field))
-    #:attr ctor-id (and (attribute abstract?) (generate-temporary #'name))
+    #:with expand-name (derived-id "expand-" #'name "")
+    #:with name-id (derived-id "" #'name "-id")
+    #:with [field-tmp ...] (generate-temporaries (attribute field))
     (begin
-      (struct name {~? super-name} [field ...]
-        {~? {~@ #:constructor-name ctor-id}}
-        {~@ #:property prop prop-val} ...)
+      (define-syntax-generic name #:dispatch-on dispatch-on-id-only)
+      {~? (define (make-name field-tmp ...)
+            (generics [name (lambda (stx) (values field-tmp ...))]))}
+      (define (expand-name stx [sc #f])
+        (apply-as-transformer name sc stx))
       (define-syntax-class (name-id [sc #f])
-        #:description #f
+        #:description err-name
         #:commit
-        #:attributes [value every-field ...]
-        [pattern {~var x (local-value name? (and sc (scope-defctx sc)) #:name err-name)}
-                 #:attr value (attribute x.local-value)
-                 #:do [(match-define (struct name [field-tmp ...]) (attribute value))]
-                 {~@ #:attr every-field field-tmp} ...])))
+        #:attributes [field ...]
+        [pattern x
+                 #:when (name? #'x sc)
+                 #:do [(define-values [field-tmp ...] (expand-name #'x sc))]
+                 {~@ #:attr field field-tmp} ...])))
 
   ; Variables, type variables, and type constructors are really just special bindings with a type or
   ; kind attached. Module-level runtime variables also have an associated Racket binding, for use
   ; during program extraction.
-  (define-syntax-info var (type) #:abstract #:name "variable")
-  (define-syntax-info local-var var () #:name "variable")
-  (define-syntax-info module-var var (racket-id) #:name "variable")
+  (define-syntax-info var (type)
+    #:name "variable"
+    #:constructor-name make-local-var)
+  (define-syntax-info module-var (racket-id)
+    #:constructor-name #f)
+  (define (make-module-var type racket-id)
+    (generics
+     [var (lambda (stx) type)]
+     [module-var (lambda (stx) racket-id)]))
+
   (define-syntax-info type-var (kind) #:name "type variable")
   (define-syntax-info type-constructor (kind) #:name "type constructor"))
 
@@ -229,8 +247,8 @@
       [(#%forall ~! [x:id : k:type] t:type)
        (~a "(forall [" (syntax-e #'x) " : " (type->string #'k) "] " (type->string #'t) ")")]))
 
-  (define/contract (type=! actual-t expected-t #:src src-stx)
-    (-> syntax? syntax? #:src syntax? void?)
+  (define/contract (type=! actual-t expected-t [sc #f] #:src src-stx)
+    (-> syntax? syntax? (or/c scope? #f) #:src syntax? void?)
     (let loop ([actual-t actual-t]
                [expected-t expected-t]
                [ctx (make-immutable-free-id-table)])
@@ -238,10 +256,10 @@
         #:context 'type=!
         #:literal-sets [core-type-literals]
         #:datum-literals [:]
-        [[actual-x:type-var-id expected-x:type-var-id]
+        [[{~var actual-x (type-var-id sc)} {~var expected-x (type-var-id sc)}]
          #:when (free-identifier=? #'actual-x #'expected-x)
          (void)]
-        [[actual-x:type-constructor-id expected-x:type-constructor-id]
+        [[{~var actual-x (type-constructor-id sc)} {~var expected-x (type-constructor-id sc)}]
          #:when (free-identifier=? #'actual-x #'expected-x)
          (void)]
         [[actual-x:id expected-x:id]
@@ -314,8 +332,8 @@
 
   (struct e+t (e t) #:transparent)
 
-  (define (e+t-e/t=! v t #:src src-stx)
-    (type=! (e+t-t v) t #:src src-stx)
+  (define (e+t-e/t=! v t [sc #f] #:src src-stx)
+    (type=! (e+t-t v) t sc #:src src-stx)
     (e+t-e v))
 
   (define (expand-module stxs)
@@ -350,8 +368,8 @@
                                                       this-syntax)
                                        stxs-deferred*))]
              [(head:#%define ~! x:id : {~type t:type} e:expr)
-              #:do [(define t- (e+t-e/t=! (expand-type #'t #f) #'Type #:src #'t))
-                    (define x- (scope-bind! sc #'x (local-var t-)))]
+              #:do [(define t- (e+t-e/t=! (expand-type #'t #f) #'Type sc #:src #'t))
+                    (define x- (scope-bind! sc #'x (make-local-var t-)))]
               (loop stxs-to-go* (cons (datum->syntax this-syntax
                                                      (list #'head x- ': t- #'e)
                                                      this-syntax
@@ -408,7 +426,7 @@
                            expanded-decls)
                      main-decls)]
             [(head:#%define ~! x:id : t:type e:expr)
-             #:do [(define e- (e+t-e/t=! (expand-expr #'e sc) #'t #:src #'e))]
+             #:do [(define e- (e+t-e/t=! (expand-expr #'e sc) #'t sc #:src #'e))]
              (values (cons (datum->syntax this-syntax
                                           (list #'head #'x ': #'t e-)
                                           this-syntax
@@ -471,14 +489,14 @@
                    'system-f "cannot apply a value that is not a function" this-syntax #'f '()
                    (~a "\n  expected type: ((-> t1) t2)\n  actual type: " (type->string f-t)))]))]
        (e+t (datum->syntax this-syntax
-                           (list #'head f- (e+t-e/t=! (recur #'e) e-t #:src #'e))
+                           (list #'head f- (e+t-e/t=! (recur #'e) e-t sc #:src #'e))
                            this-syntax
                            this-syntax)
             r-t)]
       [(head:#%lambda ~! [x:id : {~type t:type}] e:expr)
        #:do [(define sc* (make-expression-scope sc))
-             (define t- (e+t-e/t=! (expand-type #'t sc) #'Type #:src #'t))
-             (define x- (scope-bind! sc* #'x (local-var t-)))
+             (define t- (e+t-e/t=! (expand-type #'t sc) #'Type sc #:src #'t))
+             (define x- (scope-bind! sc* #'x (make-local-var t-)))
              (match-define (e+t e- e-t) (expand-expr (in-scope sc* #'e) sc*))]
        (e+t (datum->syntax this-syntax
                            (list #'head (list x- ': t-) e-)
@@ -499,7 +517,7 @@
                    this-syntax #'e '()
                    (~a "\n  expected type: (forall [x : k] t)\n  actual type: "
                        (type->string e-t)))]))
-             (define t- (e+t-e/t=! (expand-type #'t sc) x-k #:src #'t))
+             (define t- (e+t-e/t=! (expand-type #'t sc) x-k sc #:src #'t))
              (define sc* (make-expression-scope sc))
              (scope-bind! sc* x (generics #:property prop:id-only? #t
                                           [system-f-type (make-substituting-transformer t-)]))
@@ -511,8 +529,8 @@
             instantiated-t)]
       [(head:#%Lambda ~! [{~type x:id} : {~type k:type}] e:expr)
        #:do [(define sc* (make-expression-scope sc))
-             (define k- (e+t-e/t=! (expand-type #'k sc) #'Type #:src #'k))
-             (define x- (scope-bind! sc* #'x (type-var k-)))
+             (define k- (e+t-e/t=! (expand-type #'k sc) #'Type sc #:src #'k))
+             (define x- (scope-bind! sc* #'x (make-type-var k-)))
              (match-define (e+t e- e-t) (expand-expr (in-scope sc* #'e) sc*))]
        (e+t (datum->syntax this-syntax
                            (list #'head (list x- ': k-) e-)
@@ -551,14 +569,14 @@
                    'system-f "cannot apply a type that is not a constructor" this-syntax #'t1 '()
                    (~a "\n  expected kind: ((-> k1) k2)\n  actual kind: " (type->string k1)))]))]
        (e+t (datum->syntax this-syntax
-                           (list #'head t1- (e+t-e/t=! (recur #'t2) k2 #:src #'t2))
+                           (list #'head t1- (e+t-e/t=! (recur #'t2) k2 sc #:src #'t2))
                            this-syntax
                            this-syntax)
             kr)]
       [(head:#%forall ~! [x:id : k:type] t:type)
        #:do [(define sc* (make-expression-scope sc))
-             (define k- (e+t-e/t=! (recur #'k) #'Type #:src #'k))
-             (define x- (scope-bind! sc* #'x (type-var k-)))
+             (define k- (e+t-e/t=! (recur #'k) #'Type sc #:src #'k))
+             (define x- (scope-bind! sc* #'x (make-type-var k-)))
              (match-define (e+t t- t-k) (expand-type (in-scope sc* #'t) sc*))]
        (e+t (datum->syntax this-syntax
                            (list #'head (list x- ': k-) t-)
@@ -760,7 +778,7 @@
         #`(begin
             (define-residual #,(system-f-type->residual-racket-expr #'t))
             (define internal-x #,(system-f-expr->racket-expr (internal-introduce #'e)))
-            (define-syntax x (module-var (quote-syntax t) #'internal-x)))]
+            (define-syntax x (make-module-var (quote-syntax t) #'internal-x)))]
        [(#%define-syntax ~! x:id e)
         #`(define-syntax x (if #,(current-is-reexpanding?-id) #f e))]
        [(#%define-main ~! e:expr)
@@ -909,17 +927,17 @@
 
 ;; ---------------------------------------------------------------------------------------------------
 
-(define-syntax Type (type-constructor #'Type))
-(define-syntax -> (type-constructor
+(define-syntax Type (make-type-var #'Type))
+(define-syntax -> (make-type-var
                    #'(#%type:app (#%type:app -> Type) (#%type:app (#%type:app -> Type) Type))))
-(define-syntax Integer (type-constructor #'Type))
-(define-syntax String (type-constructor #'Type))
-(define-syntax Unit (type-constructor #'Type))
+(define-syntax Integer (make-type-var #'Type))
+(define-syntax String (make-type-var #'Type))
+(define-syntax Unit (make-type-var #'Type))
 
 (define-syntax-parser define-system-f-primitive
   [(_ x:id : t:type racket-id:id)
    #'(define-syntax x
-       (module-var
+       (make-module-var
         (e+t-e/t=! (expand-type #'t #f) #'Type #:src (quote-syntax t))
         #'racket-id))])
 
