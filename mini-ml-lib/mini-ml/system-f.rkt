@@ -42,6 +42,7 @@
                      threading
                      "private/util/stx.rkt")
          syntax/parse/define
+         "private/extract.rkt"
          "private/namespace.rkt")
 
 (provide (rename-out [#%system-f:module-begin #%module-begin]))
@@ -52,6 +53,7 @@
 (provide/namespace namespace:value
                    (rename-out [#%require require]
                                [#%provide provide]
+                               [system-f:shift shift]
                                [#%define define]
                                [#%define-syntax define-syntax]
                                [#%define-main define-main]
@@ -348,6 +350,7 @@
           [(cons stx stxs-to-go*)
            (syntax-parse stx
              #:literal-sets [core-decl-literals]
+             #:literals [#%plain-module-begin begin-for-syntax]
              #:datum-literals [:]
              [(head:#%require ~! rs ...)
               #:with [expanded-rs ...] (append-map (lambda (rs) (expand-system-f-require-spec rs sc))
@@ -378,8 +381,8 @@
              [(head:#%define-syntax ~! x:id e)
               #:with e- (local-transformer-expand
                          #`(let ([transformer e])
-                             (generics [dml-decl transformer]
-                                       [dml-expr transformer]))
+                             (generics [system-f-decl transformer]
+                                       [system-f-expr transformer]))
                          'expression
                          '()
                          (list (scope-defctx sc)))
@@ -394,7 +397,15 @@
                               (macro-track-origin d this-syntax))
                             stxs-to-go*)
                     stxs-deferred)]
-             [({~or #%define-type #%begin-for-syntax}
+             [(head:#%begin-for-syntax ~! d ...)
+              #:with (#%plain-module-begin (begin-for-syntax d- ...))
+              (local-expand #'(#%plain-module-begin (begin-for-syntax d ...)) 'module-begin '())
+              (loop stxs-to-go* (cons (datum->syntax this-syntax
+                                                     (cons #'head (attribute d-))
+                                                     this-syntax
+                                                     this-syntax)
+                                      stxs-deferred))]
+             [({~or #%define-type}
                ~! . _)
               (error "not yet implemented")]
              [({~or #%provide #%define-main} ~! . _)
@@ -413,7 +424,7 @@
           (syntax-parse stx
             #:literal-sets [core-decl-literals]
             #:datum-literals [:]
-            [(#%require ~! . _)
+            [({~or #%require #%define-syntax #%begin-for-syntax} ~! . _)
              ; already handled in first pass
              (values (cons this-syntax expanded-decls) main-decls)]
             [(head:#%provide ~! ps ...)
@@ -433,8 +444,6 @@
                                           this-syntax)
                            expanded-decls)
                      main-decls)]
-            [(#%define-syntax ~! _:id _)
-             (values (cons this-syntax expanded-decls) main-decls)]
             [(head:#%define-main ~! e:expr)
              #:do [(define e- (e+t-e (expand-expr #'e sc)))]
              (values (cons (datum->syntax this-syntax
@@ -634,18 +643,21 @@
     [pattern _:root-module-path]
     [pattern (submod ~! {~or _:root-module-path "." ".."} _:id ...+)])
 
+  (define (shift-phase phase shift)
+    (and phase shift (+ phase shift)))
+
   (define (calculate-phase-shift new-phase orig-phase)
     (and new-phase orig-phase (- new-phase orig-phase)))
 
   (define-syntax-class require-#%binding
     #:description #f
     #:no-delimit-cut
-    #:attributes [external-id external-phase ns-key mod-path internal-id internal-phase]
+    #:attributes [head external-id external-phase ns-key mod-path internal-id internal-phase]
     #:literal-sets [core-require-spec-literals]
     #:datum-literals [=>]
-    [pattern (#%binding ~! external-id:id #:at external-phase:phase-level
-                        #:from {~or ns-key:id #f} #:in mod-path:module-path
-                        => internal-id:id #:at internal-phase:phase-level)])
+    [pattern (head:#%binding ~! external-id:id #:at external-phase:phase-level
+                             #:from {~or ns-key:id #f} #:in mod-path:module-path
+                             => internal-id:id #:at internal-phase:phase-level)])
 
   (define (expand-system-f-require-spec stx sc)
     (define (recur stx) (expand-system-f-require-spec stx sc))
@@ -669,8 +681,14 @@
                               external-sym '#:at phase
                               '#:from (and ns (namespace-key ns)) '#:in #'mod-path
                               '=> ns-internal-id '#:at 0)))]
-      [_:require-#%binding
-       (list this-syntax)]
+      [:require-#%binding
+       (list (datum->syntax this-syntax
+                            (list #'head #'external-id '#:at #'external-phase
+                                  '#:from (attribute ns-key) '#:in #'mod-path
+                                  '=> (syntax-local-identifier-as-binding #'internal-id)
+                                  '#:at #'internal-phase)
+                            this-syntax
+                            this-syntax))]
       [(#%union ~! rs ...)
        (for*/list ([rs (in-list (attribute rs))]
                    [expanded-rs (in-list (recur rs))])
@@ -680,16 +698,16 @@
                                   this-syntax))]))
 
   (define (local-expand-system-f-require-spec stx [sc #f])
-    (datum->syntax #f (list (datum->syntax #'here '#%union) (expand-system-f-require-spec stx sc))))
+    (datum->syntax #f (cons (datum->syntax #'here '#%union) (expand-system-f-require-spec stx sc))))
 
   (define-syntax-class provide-#%binding
     #:description #f
     #:no-delimit-cut
-    #:attributes [internal-id external-id phase ns-key]
+    #:attributes [head internal-id external-id phase ns-key]
     #:literal-sets [core-provide-spec-literals]
     #:datum-literals [=>]
-    [pattern (#%binding ~! internal-id:id => external-id:id
-                        #:at phase:phase-level #:in {~or ns-key:id #f})])
+    [pattern (head:#%binding ~! internal-id:id => external-id:id
+                             #:at phase:phase-level #:in {~or ns-key:id #f})])
 
   (define (expand-system-f-provide-spec stx sc)
     (define (recur stx) (expand-system-f-provide-spec stx sc))
@@ -707,11 +725,43 @@
                    [expanded-ps (in-list (recur ps))])
          (macro-track-origin expanded-ps this-syntax))]
       [_
-       (recur (macro-track-origin (apply-as-transformer system-f-require-spec sc this-syntax)
+       (recur (macro-track-origin (apply-as-transformer system-f-provide-spec sc this-syntax)
                                   this-syntax))]))
 
   (define (local-expand-system-f-provide-spec stx [sc #f])
-    (datum->syntax #f (list (datum->syntax #'here '#%union) (expand-system-f-provide-spec stx sc)))))
+    (datum->syntax #f (cons (datum->syntax #'here '#%union) (expand-system-f-provide-spec stx sc)))))
+
+(define-syntax system-f:shift
+  (generics
+   [system-f-require-spec
+    (syntax-parser
+      #:literal-sets [core-require-spec-literals]
+      [(_ phase-stx:phase-level rs ...)
+       #:do [(define phase (syntax-e #'phase-stx))]
+       #:with (#%union b ...) (local-expand-system-f-require-spec #`(#%union rs ...))
+       #`(#%union #,@(for/list ([b-stx (in-list (attribute b))])
+                       (define/syntax-parse b:require-#%binding b-stx)
+                       (datum->syntax b-stx
+                                      (list #'b.head #'b.external-id '#:at #'b.external-phase
+                                            '#:from (attribute b.ns-key) '#:in #'b.mod-path
+                                            '=> #'b.internal-id
+                                            '#:at (shift-phase (syntax-e #'b.internal-phase) phase))
+                                      b-stx
+                                      b-stx)))])]
+   [system-f-provide-spec
+    (syntax-parser
+      #:literal-sets [core-provide-spec-literals]
+      [(_ phase-stx:phase-level ps ...)
+       #:do [(define phase (syntax-e #'phase-stx))]
+       #:with [(#%union b ...)] (local-expand-system-f-provide-spec #`(#%union ps ...))
+       #`(#%union #,@(for/list ([b-stx (in-list (attribute b))])
+                       (define/syntax-parse b:provide-#%binding b-stx)
+                       (datum->syntax b-stx
+                                      (list #'b.head #'b.internal-id '=> #'b.external-id
+                                            '#:at (shift-phase (syntax-e #'b.phase) phase)
+                                            '#:in (attribute b.ns-key))
+                                      b-stx
+                                      b-stx)))])]))
 
 ;; ---------------------------------------------------------------------------------------------------
 ;; extraction
@@ -739,30 +789,7 @@
 ; right-hand side of each `#%define` declaration, but nowhere else, which redirects exactly the
 ; appropriate references.
 
-; To help Check Syntax, it’s useful to sometimes leave behind “residual” expressions that will never
-; be evaluated (and can therefore be totally optimized away by the compiler) that preserve some of the
-; binding structure of the original program. To ensure that they can be optimized away, this macro
-; wraps them in a lambda that can never be called and returns zero values.
-(define-simple-macro (residual e:expr)
-  (#%expression (begin (lambda () e) (values))))
-
-(define-simple-macro (with-residual [residual-e:expr ...] e:expr)
-  (let-values ([() (residual residual-e)] ...) e))
-(define-simple-macro (define-residual residual-e:expr ...)
-  (begin (define-values [] (residual residual-e)) ...))
-
-; Expanding directly to an identifier with a 'disappeared-use property when generating residual
-; expressions from types causes problems for type variables bound by `#%forall`, since when the
-; residual `#%plain-lambda` expressions get expanded by the Racket expander, the variable acquires
-; an extra scope that won’t be in the property. By delaying the introduction of the property, the
-; identifier will properly acquire the extra scope before being moved into the property.
-(define-syntax-parser record-use
-  [(_ x:id)
-   (syntax-property #''x 'disappeared-use (syntax-local-introduce #'x))])
-
 (begin-for-syntax
-  (define current-is-reexpanding?-id (make-parameter #f))
-
   (define (system-f-decl->racket-decl stx internal-introduce)
     (macro-track-origin
      (syntax-parse stx
@@ -776,11 +803,14 @@
        [(#%define ~! x:id : t:type e:expr)
         #:with internal-x (internal-introduce #'x)
         #`(begin
-            (define-residual #,(system-f-type->residual-racket-expr #'t))
-            (define internal-x #,(system-f-expr->racket-expr (internal-introduce #'e)))
-            (define-syntax x (make-module-var (quote-syntax t) #'internal-x)))]
+            (define internal-x #,(~> (system-f-expr->racket-expr (internal-introduce #'e))
+                                     (syntax-track-residual (system-f-type->residual #'t))))
+            (define-syntax x (make-module-var (quote-syntax/launder t)
+                                              (quote-syntax/launder internal-x))))]
        [(#%define-syntax ~! x:id e)
-        #`(define-syntax x (if #,(current-is-reexpanding?-id) #f e))]
+        #`(define-syntax x #,(suspend-expression #'e))]
+       [(#%begin-for-syntax ~! d ...)
+        #`(begin-for-syntax #,@(map suspend-racket-decl (attribute d)))]
        [(#%define-main ~! e:expr)
         #`(module* main #f
             (#%plain-module-begin
@@ -806,15 +836,15 @@
        [(#%system-f:app ~! f:expr e:expr)
         #`(#%plain-app #,(system-f-expr->racket-expr #'f) #,(system-f-expr->racket-expr #'e))]
        [(#%lambda ~! [x:id : t:type] e:expr)
-        #`(with-residual [#,(system-f-type->residual-racket-expr #'t)]
-            (#%plain-lambda [x] #,(system-f-expr->racket-expr #'e)))]
+        (~> #`(#%plain-lambda [x] #,(system-f-expr->racket-expr #'e))
+            (syntax-track-residual (system-f-type->residual #'t)))]
        [(#%App ~! e:expr t:type)
-        #`(with-residual [#,(system-f-type->residual-racket-expr #'t)]
-            #,(system-f-expr->racket-expr #'e))]
+        (~> (system-f-expr->racket-expr #'e)
+            (syntax-track-residual (system-f-type->residual #'t)))]
        [(#%Lambda ~! [x:id : k:type] e:expr)
-        (~> #`(with-residual [#,(system-f-type->residual-racket-expr #'k)]
-                #,(system-f-expr->racket-expr #'e))
-            (syntax-property 'disappeared-binding (syntax-local-introduce #'x)))]
+        (~> (system-f-expr->racket-expr #'e)
+            (syntax-track-residual (make-residual (list (system-f-type->residual #'k))
+                                                  #:bindings (list #'x))))]
        [_
         (raise-syntax-error
          'system-f
@@ -822,21 +852,26 @@
          this-syntax)])
      stx))
 
-  (define (system-f-type->residual-racket-expr stx)
-    (macro-track-origin
-     (syntax-parse stx
-       #:literal-sets [core-type-literals]
-       #:datum-literals [:]
-       [x:id
-        #'(record-use x)]
-       [(#%type:app ~! t1:type t2:type)
-        #`(#%plain-app #,(system-f-type->residual-racket-expr #'t1)
-                       #,(system-f-type->residual-racket-expr #'t2))]
-       [(#%forall ~! [x:id : k:type] t:type)
-        #`(#%plain-lambda [x]
-                          #,(system-f-type->residual-racket-expr #'k)
-                          #,(system-f-type->residual-racket-expr #'t))])
-     stx))
+  (define system-f-type->residual
+    (syntax-parser
+      #:literal-sets [core-type-literals]
+      #:datum-literals [:]
+      [_:id
+       (make-residual #:origin this-syntax)]
+      [(#%type:app ~! t1:type t2:type)
+       (make-residual (list (system-f-type->residual #'t1)
+                            (system-f-type->residual #'t2))
+                      #:origin this-syntax)]
+      [(#%forall ~! [x:id : k:type] t:type)
+       (make-residual (list (system-f-type->residual #'k)
+                            (system-f-type->residual #'t))
+                      #:origin this-syntax
+                      #:bindings (list #'x))]
+      [_
+       (raise-syntax-error
+        'system-f
+        "internal error: unexpected type form found during extraction to racket"
+        this-syntax)]))
 
   (define (system-f-require-spec->racket-require-spec stx)
     (macro-track-origin
@@ -901,11 +936,11 @@
    #:do [(println (syntax-local-introduce
                    #`(#%system-f:module-begin
                       #,@(filter system-f-debug-print-decl? (attribute expanded-decl)))))]
-   #:with is-reexpanding?-id (generate-temporary 'is-reexpanding?)
    #:do [(define internal-introducer (make-syntax-introducer #t))
          (define (internal-introduce stx)
-           (introduce-everywhere stx (lambda (stx) (internal-introducer stx 'add))))]
-   #:with [racket-decl ...] (parameterize ([current-is-reexpanding?-id #'is-reexpanding?-id])
+           (introduce-everywhere stx (lambda (stx) (internal-introducer stx 'add))))
+         (define suspenders (make-suspenders))]
+   #:with [racket-decl ...] (parameterize ([current-suspenders suspenders])
                               (for/list ([expanded-decl (in-list (attribute expanded-decl))])
                                 (system-f-decl->racket-decl expanded-decl internal-introduce)))
    ; Add an extra scope to everything to “freshen” binders. The expander complains if an identifier
@@ -919,10 +954,8 @@
                                   (introduce-everywhere
                                    racket-decl
                                    (lambda (stx) (finalizer-introducer stx 'add))))
-   #'(begin
-       (define-for-syntax is-reexpanding?-id #f)
-       (let-syntax ([_ (set! is-reexpanding?-id #t)])
-         (void))
+   #`(begin
+       #,(suspenders->racket-decl suspenders)
        introduced-decl ...)])
 
 ;; ---------------------------------------------------------------------------------------------------

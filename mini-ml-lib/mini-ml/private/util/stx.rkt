@@ -1,8 +1,10 @@
 #lang racket/base
 
-(require racket/contract
+(require (for-syntax racket/base)
+         racket/contract
          racket/match
          syntax/parse
+         syntax/parse/define
          threading)
 
 (provide (contract-out [module-path-syntax? (-> syntax? boolean?)]
@@ -21,6 +23,9 @@
                                                        [#:use-mode? any/c
                                                         #:failure-proc (-> any)]
                                                        any)]
+                       [syntax-property-extend (->* [syntax? any/c any/c]
+                                                    [(-> any/c any/c any/c)]
+                                                    syntax?)]
                        [adjust-property (-> syntax? any/c (-> any/c any/c) syntax?)]
                        [recursively-adjust-property (-> (and/c syntax? (not/c syntax-tainted?))
                                                         any/c
@@ -28,7 +33,8 @@
                                                         syntax?)]
                        [derived-id (-> string? syntax? string? syntax?)]
                        [macro-track-origin (->* [syntax? syntax?] [#:flip-scopes? any/c] syntax?)]
-                       [introduce-everywhere (-> syntax? (-> syntax? syntax?) syntax?)]))
+                       [introduce-everywhere (-> syntax? (-> syntax? syntax?) syntax?)])
+         quote-syntax/launder)
 
 ;; ---------------------------------------------------------------------------------------------------
 ;; module paths
@@ -98,6 +104,10 @@
 
 ;; ---------------------------------------------------------------------------------------------------
 ;; properties
+
+(define (syntax-property-extend stx key new-val [extend cons])
+  (define old-val (syntax-property stx key))
+  (syntax-property stx key (if old-val (extend new-val old-val) new-val)))
 
 ; Modifies the property of a syntax object by applying a procedure to its value. If the syntax object
 ; does not contain any such property, the original syntax object is returned. Otherwise, the
@@ -171,3 +181,15 @@
                                       (vector (introduce id-1) start-1 span-1 x-1 y-1
                                               (introduce id-2) start-2 span-2 x-2 y-2)]
                                      [other other]))))
+
+; Like `quote-syntax`, but adds a macro-introduction scope so that the syntax will not be original in
+; the sense of `syntax-original?`, and Check Syntax will ignore it for the purpose of drawing binding
+; arrows. Note that if the syntax will eventually end up in binding position, this is a bad idea,
+; since the extra scope will prevent uses from seeing the binding.
+(define-syntax-parser quote-syntax/launder
+  [(_ stx)
+   (datum->syntax this-syntax
+                  (list #'quote-syntax
+                        ((make-syntax-introducer) #'stx))
+                  this-syntax
+                  this-syntax)])
