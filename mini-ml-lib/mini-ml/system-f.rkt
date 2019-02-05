@@ -27,7 +27,7 @@
 (require (for-meta 2 racket/base
                      racket/syntax
                      syntax/parse/class/struct-id
-                     "private/util/stx.rkt")
+                     "private/util/syntax.rkt")
          (for-syntax racket/base
                      racket/contract
                      racket/format
@@ -40,7 +40,7 @@
                      syntax/parse/define
                      syntax-generic2
                      threading
-                     "private/util/stx.rkt")
+                     "private/util/syntax.rkt")
          syntax/parse/define
          "private/extract.rkt"
          "private/namespace.rkt")
@@ -116,90 +116,6 @@
       (case key
         [(module-language) 'mini-ml/system-f]
         [else default]))))
-
-;; ---------------------------------------------------------------------------------------------------
-;; require scopes
-
-(begin-for-syntax
-  (define scopeless-stx (datum->syntax #f #f))
-
-  (struct require-scope (introducer))
-
-  (define-syntax-class phase-level
-    #:description "phase level"
-    #:commit
-    #:attributes []
-    [pattern _:exact-integer]
-    [pattern #f])
-
-  (define-syntax-class (normalized-raw-require-spec #:allow-just-meta? [allow-just-meta? #t]
-                                                    #:allow-phase-shift? [allow-phase-shift? #t])
-    #:description (if (or allow-just-meta? allow-phase-shift?)
-                      "raw require spec"
-                      "phaseless raw require spec")
-    #:commit
-    #:attributes [[phase-restriction 1] [phase-shift 1] [phaseless-spec 1]]
-    #:datum-literals [for-meta for-syntax for-template for-label just-meta]
-    [pattern (just-meta ~! p:phase-level rs ...)
-             #:declare rs (normalized-raw-require-spec #:allow-just-meta? #f
-                                                       #:allow-phase-shift? allow-phase-shift?)
-             #:fail-unless allow-just-meta? "invalid nesting"
-             #:attr [phase-shift 1] (append* (attribute rs.phase-shift))
-             #:attr [phaseless-spec 1] (append* (attribute rs.phaseless-spec))
-             #:attr [phase-restriction 1] (make-list (length (attribute phaseless-spec)) #'p)]
-    [pattern ({~or* {~seq for-meta ~! p:phase-level}
-                    {~seq for-syntax ~! {~bind [p #'1]}}
-                    {~seq for-template ~! {~bind [p #'-1]}}
-                    {~seq for-label ~! {~bind [p #'#f]}}}
-              rs ...)
-             #:declare rs (normalized-raw-require-spec #:allow-just-meta? allow-just-meta?
-                                                       #:allow-phase-shift? #f)
-             #:fail-unless allow-phase-shift? "invalid nesting"
-             #:attr [phase-restriction 1] (append* (attribute rs.phase-restriction))
-             #:attr [phaseless-spec 1] (append* (attribute rs.phaseless-spec))
-             #:attr [phase-shift 1] (make-list (length (attribute phaseless-spec)) #'p)]
-    [pattern rs
-             #:attr [phase-restriction 1] (list #f)
-             #:attr [phase-shift 1] (list #'0)
-             #:attr [phaseless-spec 1] (list #'rs)])
-
-  (define (group-raw-require-specs-by-phase stxs)
-    (for/fold ([phase=>specs (hasheqv)])
-              ([stx (in-list stxs)])
-      (syntax-parse stx
-        #:context 'make-require-scope!
-        [rs:normalized-raw-require-spec
-         (for/fold ([phase=>specs phase=>specs])
-                   ([phase-restriction (in-list (attribute rs.phase-restriction))]
-                    [phase-shift (in-list (attribute rs.phase-shift))]
-                    [phaseless-spec (in-list (attribute rs.phaseless-spec))])
-           (define restricted-spec
-             (if phase-restriction
-                 #`(just-meta #,phase-restriction #,phaseless-spec)
-                 phaseless-spec))
-           (hash-update phase=>specs
-                        (syntax-e phase-shift)
-                        (lambda (specs) (cons restricted-spec specs))
-                        '()))])))
-
-  (define (make-require-scope! raw-require-specs
-                               #:flip-scopes? [flip-scopes? #t]
-                               #:origin [origin #f])
-    (define flipped-specs (if flip-scopes?
-                              (map syntax-local-introduce raw-require-specs)
-                              raw-require-specs))
-    (define maybe-track (if origin
-                            (lambda (stx) (macro-track-origin stx origin))
-                            values))
-    (define phase=>specs (group-raw-require-specs-by-phase flipped-specs))
-    (define scoped-stx (for/fold ([scoped-stx scopeless-stx])
-                                 ([(phase specs) (in-hash phase=>specs)])
-                         (define shifted-spec (maybe-track #`(for-meta #,phase #,@specs)))
-                         (syntax-local-lift-require shifted-spec scoped-stx)))
-    (require-scope (make-syntax-delta-introducer scoped-stx scopeless-stx)))
-
-  (define (require-scope-introduce rsc stx [mode 'flip])
-    ((require-scope-introducer rsc) stx mode)))
 
 ;; ---------------------------------------------------------------------------------------------------
 ;; keywords

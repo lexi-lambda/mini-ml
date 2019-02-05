@@ -64,7 +64,7 @@
                      syntax/id-set
                      syntax/parse/define
                      threading
-                     "util/stx.rkt")
+                     "util/syntax.rkt")
          syntax/parse/define)
 
 (begin-for-syntax

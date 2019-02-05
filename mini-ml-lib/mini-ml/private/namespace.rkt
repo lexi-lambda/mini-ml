@@ -39,7 +39,7 @@
 
 (require (for-meta 2 racket/base
                      racket/syntax
-                     "util/stx.rkt")
+                     "util/syntax.rkt")
          (for-syntax net/base64
                      racket/base
                      racket/contract
@@ -47,7 +47,7 @@
                      racket/set
                      racket/syntax
                      syntax/parse/define
-                     "util/stx.rkt")
+                     "util/syntax.rkt")
          syntax/parse/define)
 
 (provide define-namespace provide/namespace)
