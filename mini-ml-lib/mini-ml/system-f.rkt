@@ -122,16 +122,82 @@
 
 (begin-for-syntax
   (define scopeless-stx (datum->syntax #f #f))
+
   (struct require-scope (introducer))
-  (define (make-require-scope! mod-path
+
+  (define-syntax-class phase-level
+    #:description "phase level"
+    #:commit
+    #:attributes []
+    [pattern _:exact-integer]
+    [pattern #f])
+
+  (define-syntax-class (normalized-raw-require-spec #:allow-just-meta? [allow-just-meta? #t]
+                                                    #:allow-phase-shift? [allow-phase-shift? #t])
+    #:description (if (or allow-just-meta? allow-phase-shift?)
+                      "raw require spec"
+                      "phaseless raw require spec")
+    #:commit
+    #:attributes [[phase-restriction 1] [phase-shift 1] [phaseless-spec 1]]
+    #:datum-literals [for-meta for-syntax for-template for-label just-meta]
+    [pattern (just-meta ~! p:phase-level rs ...)
+             #:declare rs (normalized-raw-require-spec #:allow-just-meta? #f
+                                                       #:allow-phase-shift? allow-phase-shift?)
+             #:fail-unless allow-just-meta? "invalid nesting"
+             #:attr [phase-shift 1] (append* (attribute rs.phase-shift))
+             #:attr [phaseless-spec 1] (append* (attribute rs.phaseless-spec))
+             #:attr [phase-restriction 1] (make-list (length (attribute phaseless-spec)) #'p)]
+    [pattern ({~or* {~seq for-meta ~! p:phase-level}
+                    {~seq for-syntax ~! {~bind [p #'1]}}
+                    {~seq for-template ~! {~bind [p #'-1]}}
+                    {~seq for-label ~! {~bind [p #'#f]}}}
+              rs ...)
+             #:declare rs (normalized-raw-require-spec #:allow-just-meta? allow-just-meta?
+                                                       #:allow-phase-shift? #f)
+             #:fail-unless allow-phase-shift? "invalid nesting"
+             #:attr [phase-restriction 1] (append* (attribute rs.phase-restriction))
+             #:attr [phaseless-spec 1] (append* (attribute rs.phaseless-spec))
+             #:attr [phase-shift 1] (make-list (length (attribute phaseless-spec)) #'p)]
+    [pattern rs
+             #:attr [phase-restriction 1] (list #f)
+             #:attr [phase-shift 1] (list #'0)
+             #:attr [phaseless-spec 1] (list #'rs)])
+
+  (define (group-raw-require-specs-by-phase stxs)
+    (for/fold ([phase=>specs (hasheqv)])
+              ([stx (in-list stxs)])
+      (syntax-parse stx
+        #:context 'make-require-scope!
+        [rs:normalized-raw-require-spec
+         (for/fold ([phase=>specs phase=>specs])
+                   ([phase-restriction (in-list (attribute rs.phase-restriction))]
+                    [phase-shift (in-list (attribute rs.phase-shift))]
+                    [phaseless-spec (in-list (attribute rs.phaseless-spec))])
+           (define restricted-spec
+             (if phase-restriction
+                 #`(just-meta #,phase-restriction #,phaseless-spec)
+                 phaseless-spec))
+           (hash-update phase=>specs
+                        (syntax-e phase-shift)
+                        (lambda (specs) (cons restricted-spec specs))
+                        '()))])))
+
+  (define (make-require-scope! raw-require-specs
                                #:flip-scopes? [flip-scopes? #t]
                                #:origin [origin #f])
-    (define flipped-path (if flip-scopes? (syntax-local-introduce mod-path) mod-path))
-    (define tracked-path (if origin
-                             (macro-track-origin flipped-path origin)
-                             flipped-path))
-    (define scoped-stx (syntax-local-lift-require tracked-path scopeless-stx))
+    (define flipped-specs (if flip-scopes?
+                              (map syntax-local-introduce raw-require-specs)
+                              raw-require-specs))
+    (define maybe-track (if origin
+                            (lambda (stx) (macro-track-origin stx origin))
+                            values))
+    (define phase=>specs (group-raw-require-specs-by-phase flipped-specs))
+    (define scoped-stx (for/fold ([scoped-stx scopeless-stx])
+                                 ([(phase specs) (in-hash phase=>specs)])
+                         (define shifted-spec (maybe-track #`(for-meta #,phase #,@specs)))
+                         (syntax-local-lift-require shifted-spec scoped-stx)))
     (require-scope (make-syntax-delta-introducer scoped-stx scopeless-stx)))
+
   (define (require-scope-introduce rsc stx [mode 'flip])
     ((require-scope-introducer rsc) stx mode)))
 
@@ -357,19 +423,14 @@
                                                    (attribute rs))
               #:with [racket-rs ...] (map system-f-require-spec->racket-require-spec
                                           (attribute expanded-rs))
-              #:do [(define-values [stxs-to-go** stxs-deferred*]
-                      (for/fold ([stxs-to-go** stxs-to-go*]
-                                 [stxs-deferred* stxs-deferred])
-                                ([racket-rs (in-list (attribute racket-rs))])
-                        (define rsc (make-require-scope! racket-rs #:origin this-syntax))
-                        (define (rsc-introduce stx) (require-scope-introduce rsc stx))
-                        (values (map rsc-introduce stxs-to-go**)
-                                (map rsc-introduce stxs-deferred*))))]
-              (loop stxs-to-go** (cons (datum->syntax this-syntax
-                                                      (cons #'head (attribute expanded-rs))
-                                                      this-syntax
-                                                      this-syntax)
-                                       stxs-deferred*))]
+              #:do [(define rsc (make-require-scope! (attribute racket-rs) #:origin this-syntax))
+                    (define (rsc-introduce stx) (require-scope-introduce rsc stx 'add))]
+              (loop (map rsc-introduce stxs-to-go*)
+                    (map rsc-introduce (cons (datum->syntax this-syntax
+                                                            (cons #'head (attribute expanded-rs))
+                                                            this-syntax
+                                                            this-syntax)
+                                             stxs-deferred)))]
              [(head:#%define ~! x:id : {~type t:type} e:expr)
               #:do [(define t- (e+t-e/t=! (expand-type #'t #f) #'Type sc #:src #'t))
                     (define x- (scope-bind! sc #'x (make-local-var t-)))]
@@ -601,13 +662,6 @@
       [_
        (recur (macro-track-origin (apply-as-transformer system-f-type sc this-syntax)
                                   this-syntax))]))
-
-  (define-syntax-class phase-level
-    #:description "phase level"
-    #:commit
-    #:attributes []
-    [pattern _:exact-integer]
-    [pattern #f])
 
   (define-syntax-class relative-path-string
     #:description "relative path string"
@@ -925,13 +979,12 @@
 (define-syntax-parser #%system-f:inner-module-begin
   [(_ lang-mod-path decl ...)
    #:do [(define lang-nss (module-exported-namespaces (syntax->datum #'lang-mod-path)))
-         (define ns-rscs (for/list ([ns (in-set lang-nss)])
-                           (make-require-scope!
-                            (~>> (namespace-exports-submodule-path #'lang-mod-path ns)
-                                 (in-namespace ns)))))]
-   #:with [namespaced-decl ...] (for/fold ([decls (in-value-namespace #'[decl ...])])
-                                          ([ns-rsc (in-list ns-rscs)])
-                                  (require-scope-introduce ns-rsc decls 'add))
+         (define ns-rsc (make-require-scope!
+                         (for/list ([ns (in-set lang-nss)])
+                           (~>> (namespace-exports-submodule-path #'lang-mod-path ns)
+                                (in-namespace ns)))))]
+   #:with [namespaced-decl ...] (~> (in-value-namespace #'[decl ...])
+                                    (require-scope-introduce ns-rsc _ 'add))
    #:with [expanded-decl ...] (expand-module (attribute namespaced-decl))
    #:do [(println (syntax-local-introduce
                    #`(#%system-f:module-begin
