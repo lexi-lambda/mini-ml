@@ -47,6 +47,7 @@
                      racket/set
                      racket/syntax
                      syntax/parse/define
+                     threading
                      "util/syntax.rkt")
          syntax/parse/define)
 
@@ -64,7 +65,10 @@
                                                    [result (mod-path) (if (syntax? mod-path)
                                                                           module-path-syntax?
                                                                           module-path?)])]
-            [module-exported-namespaces (-> module-path? (set/c #:cmp 'equal namespace?))])))
+            [module-exported-namespaces (-> module-path? (set/c #:cmp 'equal namespace?))]
+            [make-namespaced-module-begin (->* [identifier? namespace?]
+                                               [#:module-begin-id identifier?]
+                                               (-> syntax? syntax?))])))
 
 ;; ---------------------------------------------------------------------------------------------------
 ;; core definitions
@@ -272,3 +276,110 @@
        (module* exported-namespaces #f
          (provide exported-namespaces)
          (define exported-namespaces (set ns-e ...))))])
+
+;; ---------------------------------------------------------------------------------------------------
+;; `#%module-begin` and the reader
+
+; The initial binding environment for a module is determined by its /module language/, which is
+; effectively a `#%require` of all identifiers from a give module. However, unlike an ordinary
+; `#%require`, the imports from the module language can be shadowed by module-level `#%require`s,
+; since there is no way for imports from the module language to be explicitly suppressed (in contrast
+; to the fine-grained namespace control allowed by Racket’s `require` form, which includes forms like
+; `only-in` and `except-in`).
+;
+; With namespaces, we need to emulate the behavior of the module language, but in a namespace-aware
+; way. Given that the exports of a module are distributed across several submodules, it’s impossible
+; to import all of them using the module language alone (since it can only refer to a single module).
+; What we can do instead is to provide a custom `#%module-begin` binding from the module language and
+; nothing else, and we can arrange for it to introduce the necessary namespaced imports. To allow the
+; imports to be shadowed, we can use `syntax-local-lift-require` instead of expanding to `#%require`
+; directly, since the imports will be in their own scope and will not collide with other
+; `#%require`-introduced identifiers.
+;
+; However, to do this, `#%module-begin` somehow needs to know about the module language, which is not
+; normally made available. We could hardcode a separate `#%module-begin` binding for each module
+; language, but this makes extending languages more awkward. Another approach is to adjust the reader
+; to explicitly pass the module language to `#%module-begin`, which allows the same `#%module-begin`
+; binding to be reused. This code takes that second approach, though it might be worth revisiting in
+; the future if it turns out to not be worth the effort.
+;
+; The `make-namespaced-module-begin` function produces a transformer that can be used as a
+; `#%module-begin` binding for a namespace-aware language. It cooperates with the reader functions
+; produced by `make-namespaced-module-reader` to take advantage of the module language information.
+
+(begin-for-syntax
+  ; Trampoline into a 'module context to establish a lift target for requires (lifts are not legal in
+  ; a 'module-begin context).
+  (define (make-namespaced-module-begin wrap-body-id default-ns
+                                        #:module-begin-id [modbeg-id #'#%plain-module-begin])
+    (syntax-parser
+      [(_ lang-mod-path:module-path d ...)
+       (quasisyntax/loc this-syntax
+         (#,modbeg-id (do-namespaced-module-begin lang-mod-path #,default-ns
+                                                  #,(quasisyntax/loc this-syntax
+                                                      (#,wrap-body-id d ...)))))])))
+
+(define-syntax-parser do-namespaced-module-begin
+  [(_ lang-mod-path default-ns d)
+   #:do [(define ns-rsc
+           (make-require-scope!
+            (for/list ([ns (in-set (module-exported-namespaces (syntax->datum #'lang-mod-path)))])
+              (in-namespace ns (namespace-exports-submodule-path #'lang-mod-path ns)))))]
+   (in-namespace (syntax-e #'default-ns) (require-scope-introduce ns-rsc #'d 'add))])
+
+(module* module-reader racket/base
+  (require racket/contract
+           racket/path
+           racket/sequence)
+
+  (provide (contract-out [make-namespaced-module-reader
+                          (->* [module-path?]
+                               [#:language-name symbol?]
+                               (values (-> input-port? none/c)
+                                       (-> any/c
+                                           input-port?
+                                           syntax?
+                                           (or/c exact-positive-integer? #f)
+                                           (or/c exact-nonnegative-integer? #f)
+                                           (or/c exact-positive-integer? #f)
+                                           syntax?)
+                                       (-> input-port?
+                                           syntax?
+                                           (or/c exact-positive-integer? #f)
+                                           (or/c exact-nonnegative-integer? #f)
+                                           (or/c exact-positive-integer? #f)
+                                           (-> any/c any/c any))))]))
+
+  (define (make-namespaced-module-reader module-language
+                                         #:language-name [language-name module-language])
+    (values
+     ; read
+     (lambda (in) (raise-arguments-error language-name "cannot be used in ‘read’ mode"))
+
+     ; read-syntax
+     (lambda (src-name in reader-mod-path line col pos)
+       (define stxs
+         (parameterize ([read-accept-lang #f])
+           (sequence->list (in-producer (lambda () (read-syntax src-name in)) eof-object?))))
+       (define module-name
+         (or (and (path? src-name)
+                  (let ([filename (file-name-from-path src-name)])
+                    (and filename
+                         (string->symbol (path->string (path-replace-extension filename #""))))))
+             'anonymous-module))
+       (define lang-mod-path (datum->syntax #f module-language reader-mod-path reader-mod-path))
+       (datum->syntax #f
+                      (list (datum->syntax #f 'module)
+                            (datum->syntax #f module-name)
+                            lang-mod-path
+                            (list* (datum->syntax #f '#%module-begin) lang-mod-path stxs))
+                      (vector src-name line col pos
+                              (and pos (let-values ([(l c p) (port-next-location in)])
+                                         (and p (- p pos)))))))
+
+     ; get-info
+     (lambda (in mod-path line col pos)
+       (lambda (key default)
+         (case key
+           [(module-language) module-language]
+           [else default]))))))

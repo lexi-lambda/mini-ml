@@ -74,48 +74,15 @@
 ;; ---------------------------------------------------------------------------------------------------
 ;; reader
 
-; Due to the way the namespacing system works, `#%module-begin` needs access to the module language in
-; order to inject the appropriate `require`s to the relevant namespace submodules. Fortunately, this
-; can be done fairly generically with a sufficiently careful `#lang` reader; unfortunately, this is
-; surprisingly awkward to do with syntax/module-reader. The following reader does the necessary work
-; to read an ordinary s-expression module while also providing the module language to the injected
-; `#%module-begin`.
-
 (module reader racket/base
-  (require racket/path
-           racket/sequence)
+  (require (submod "private/namespace.rkt" module-reader))
 
   (provide (rename-out [system-f:read read]
                        [system-f:read-syntax read-syntax])
            get-info)
 
-  (define (system-f:read in)
-    (raise-arguments-error 'system-f "cannot be used in ‘read’ mode"))
-
-  (define (system-f:read-syntax src-name in reader-mod-path line col pos)
-    (define stxs
-      (parameterize ([read-accept-lang #f])
-        (sequence->list (in-producer (lambda () (read-syntax src-name in)) eof-object?))))
-    (define name (or (and (path? src-name)
-                          (let ([filename (file-name-from-path src-name)])
-                            (and filename (string->symbol
-                                           (path->string (path-replace-extension filename #""))))))
-                     'anonymous-module))
-    (define lang-mod-path (datum->syntax #f 'mini-ml/system-f reader-mod-path reader-mod-path))
-    (datum->syntax #f
-                   (list (datum->syntax #f 'module)
-                         (datum->syntax #f name)
-                         lang-mod-path
-                         (list* (datum->syntax #f '#%module-begin) lang-mod-path stxs))
-                   (vector src-name line col pos
-                           (and pos (let-values ([(l c p) (port-next-location in)])
-                                      (and p (- p pos)))))))
-
-  (define (get-info in mod-path line col pos)
-    (lambda (key default)
-      (case key
-        [(module-language) 'mini-ml/system-f]
-        [else default]))))
+  (define-values [system-f:read system-f:read-syntax get-info]
+    (make-namespaced-module-reader 'mini-ml/system-f #:language-name 'system-f)))
 
 ;; ---------------------------------------------------------------------------------------------------
 ;; keywords
@@ -579,40 +546,6 @@
        (recur (macro-track-origin (apply-as-transformer system-f-type sc this-syntax)
                                   this-syntax))]))
 
-  (define-syntax-class relative-path-string
-    #:description "relative path string"
-    #:commit
-    #:opaque
-    #:attributes []
-    [pattern s:string #:when (relative-path? (syntax-e #'s))])
-
-  (define-syntax-class literal-path
-    #:description "literal path"
-    #:commit
-    #:opaque
-    #:attributes []
-    [pattern v #:when (path? (syntax-e #'v))])
-
-  (define-syntax-class root-module-path
-    #:description "root module path"
-    #:commit
-    #:attributes []
-    #:datum-literals [quote lib file]
-    [pattern (quote ~! _:id)]
-    [pattern _:relative-path-string]
-    [pattern (lib ~! _:relative-path-string ...+)]
-    [pattern (file ~! _:string)]
-    [pattern _:id]
-    [pattern _:literal-path])
-
-  (define-syntax-class module-path
-    #:description "module path"
-    #:commit
-    #:attributes []
-    #:datum-literals [submod]
-    [pattern _:root-module-path]
-    [pattern (submod ~! {~or _:root-module-path "." ".."} _:id ...+)])
-
   (define (shift-phase phase shift)
     (and phase shift (+ phase shift)))
 
@@ -886,22 +819,12 @@
       [({~or #%require #%define-syntax #%begin-for-syntax} ~! . _) #f]
       [_ #t])))
 
-; Defer to a secondary #%module-begin form to establish a lift target for requires (lifts are not
-; legal in a 'module-begin context).
-(define-syntax-parser #%system-f:module-begin
-  [(_ decl ...)
-   #'(#%plain-module-begin (#%system-f:inner-module-begin decl ...))])
+(define-syntax #%system-f:module-begin
+  (make-namespaced-module-begin #'do-module-begin namespace:value))
 
-(define-syntax-parser #%system-f:inner-module-begin
-  [(_ lang-mod-path decl ...)
-   #:do [(define lang-nss (module-exported-namespaces (syntax->datum #'lang-mod-path)))
-         (define ns-rsc (make-require-scope!
-                         (for/list ([ns (in-set lang-nss)])
-                           (~>> (namespace-exports-submodule-path #'lang-mod-path ns)
-                                (in-namespace ns)))))]
-   #:with [namespaced-decl ...] (~> (in-value-namespace #'[decl ...])
-                                    (require-scope-introduce ns-rsc _ 'add))
-   #:with [expanded-decl ...] (expand-module (attribute namespaced-decl))
+(define-syntax-parser do-module-begin
+  [(_ decl ...)
+   #:with [expanded-decl ...] (expand-module (attribute decl))
    #:do [(println (syntax-local-introduce
                    #`(#%system-f:module-begin
                       #,@(filter system-f-debug-print-decl? (attribute expanded-decl)))))]
