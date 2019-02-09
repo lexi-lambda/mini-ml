@@ -45,12 +45,20 @@
          "private/extract.rkt"
          "private/namespace.rkt")
 
-(provide (rename-out [#%system-f:module-begin #%module-begin]))
+(provide (rename-out [system-f:#%module-begin #%module-begin]))
 
 (define-namespace value #:unique)
 (define-namespace type #:unique)
 
 (provide/namespace namespace:value
+                   (for-syntax decl-transformer
+                               decl-id-transformer
+                               expr-transformer
+                               expr-id-transformer
+                               type-transformer
+                               type-id-transformer
+                               require-spec-transformer
+                               provide-spec-transformer)
                    (rename-out [#%require require]
                                [#%provide provide]
                                [system-f:shift shift]
@@ -103,9 +111,6 @@
       (define-literal-set class.-literals [x ...]) ...)))
 
 (define-keywords
-  (decl [#%require #%provide #%define #%define-syntax #%define-type #%define-main #%begin
-                   #%begin-for-syntax])
-  (expr [#%system-f:datum #%lambda #%system-f:app #%Lambda #%App #%case])
   (type [#%type:app #%forall])
   (require-spec [#%binding #%union])
   (provide-spec [#%binding #%union]))
@@ -238,42 +243,45 @@
 ;; expander
 
 (begin-for-syntax
-  (define (system-f-fallback thing)
+  (define (raise-invalid-thing-error thing stx)
     (define msg (string-append "not a valid " thing))
-    (lambda (stx) (raise-syntax-error 'system-f msg stx)))
+    (raise-syntax-error 'system-f msg stx))
+
+  (define id-only
+    (syntax-parser
+      [x:id #'x]
+      [_ #f]))
 
   (define pair-only
     (syntax-parser
       [(x:id . _) #'x]
       [_ #f]))
 
-  (define-syntax-generic system-f-decl (system-f-fallback "declaration"))
-  (define-syntax-generic system-f-expr (system-f-fallback "expression"))
-  (define-syntax-generic system-f-type (system-f-fallback "type"))
-  (define-syntax-generic system-f-require-spec (system-f-fallback "require spec")
-    #:dispatch-on pair-only)
-  (define-syntax-generic system-f-provide-spec (system-f-fallback "provide spec")
-    #:dispatch-on pair-only)
+  (define-syntax-generic core-decl-pass-1)
+  (define-syntax-generic core-decl-pass-2)
+  (define-syntax-generic core-decl->racket-decl)
+  (define-syntax-generic decl-transformer)
+  (define-syntax-generic decl-id-transformer #:dispatch-on id-only)
 
-  ; `make-variable-like-transformer` is an awkward way to solve a common problem: wanting a macro that
-  ; only ever expands as a single identifier, not at the head of a list. Let’s try just baking that
-  ; in, instead.
-  (define-values [prop:id-only? id-only?? id-only?-ref] (make-struct-type-property 'id-only?))
-  (define-syntax-class (id-only [sc #f])
-    #:description #f
-    #:commit
-    #:attributes []
-    [pattern {~var x (local-value id-only?? (scope-defctx sc))}
-             #:do [(define id-only? (id-only?-ref (attribute x.local-value)))]
-             #:when (if (procedure? id-only?)
-                        (id-only? (attribute x.local-value))
-                        id-only?)])
-  (define (id-only? stx [sc #f])
-    (syntax-parse stx
-      [_:id-only #t]
-      [(_:id-only . _) #t]
-      [_ #f]))
+  (define-syntax-generic core-expr)
+  (define-syntax-generic core-expr->racket-expr)
+  (define-syntax-generic expr-transformer)
+  (define-syntax-generic expr-id-transformer #:dispatch-on id-only)
 
+  (define-syntax-generic core-type)
+  (define-syntax-generic core-type->residual)
+  (define-syntax-generic type-transformer)
+  (define-syntax-generic type-id-transformer #:dispatch-on id-only)
+
+  (define-syntax-generic core-require-spec)
+  (define-syntax-generic core-require-spec->racket-raw-require-spec)
+  (define-syntax-generic require-spec-transformer #:dispatch-on pair-only)
+
+  (define-syntax-generic core-provide-spec)
+  (define-syntax-generic core-provide-spec->racket-raw-provide-spec)
+  (define-syntax-generic provide-spec-transformer #:dispatch-on pair-only)
+
+  ; FIXME: this comment is out of date!!!
   ; The common case of `prop:id-only?` is to implement a transformer like
   ; `make-variable-like-transformer`, which just expands to a particular piece of syntax, but it needs
   ; to do just a little bit extra in order to make the source locations nice. This implements that.
@@ -290,7 +298,7 @@
   (define (expand-module stxs)
     (define sc (make-definition-scope))
 
-    (define (do-initial-defs+requires-pass stxs)
+    (define (do-pass-1 stxs)
       (let loop ([stxs-to-go (map (lambda (stx) (in-scope sc stx)) stxs)]
                  [stxs-deferred '()])
         (match stxs-to-go
@@ -298,9 +306,14 @@
            (reverse stxs-deferred)]
           [(cons stx stxs-to-go*)
            (syntax-parse stx
-             #:literal-sets [core-decl-literals]
-             #:literals [#%plain-module-begin begin-for-syntax]
+             #:literals [#%require #%begin]
              #:datum-literals [:]
+             [{~var core (core-decl-pass-1 sc sc)}
+              (loop stxs-to-go* (cons (attribute core.value) stxs-deferred))]
+             [{~or {~var transformer (decl-id-transformer sc)}
+                   {~var transformer (decl-transformer sc)}}
+              (loop (cons (macro-track-origin (attribute transformer.value) this-syntax) stxs-to-go*)
+                    stxs-deferred)]
              [(head:#%require ~! rs ...)
               #:with [expanded-rs ...] (append-map (lambda (rs) (expand-system-f-require-spec rs sc))
                                                    (attribute rs))
@@ -314,80 +327,24 @@
                                                             this-syntax
                                                             this-syntax)
                                              stxs-deferred)))]
-             [(head:#%define ~! x:id : {~type t:type} e:expr)
-              #:do [(define t- (e+t-e/t=! (expand-type #'t #f) #'Type sc #:src #'t))
-                    (define x- (scope-bind! sc #'x (make-local-var t-)))]
-              (loop stxs-to-go* (cons (datum->syntax this-syntax
-                                                     (list #'head x- ': t- #'e)
-                                                     this-syntax
-                                                     this-syntax)
-                                      stxs-deferred))]
-             [(head:#%define-syntax ~! x:id e)
-              #:with e- (local-transformer-expand
-                         #`(let ([transformer e])
-                             (generics [system-f-decl transformer]
-                                       [system-f-expr transformer]))
-                         'expression
-                         '()
-                         (list (scope-defctx sc)))
-              #:with x- (scope-bind! sc #'x #'e-)
-              (loop stxs-to-go* (cons (datum->syntax this-syntax
-                                                     (list #'head #'x- #'e-)
-                                                     this-syntax
-                                                     this-syntax)
-                                      stxs-deferred))]
-             [(head:#%begin ~! d ...)
+             [(#%begin ~! d ...)
               (loop (append (for/list ([d (in-list (attribute d))])
                               (macro-track-origin d this-syntax))
                             stxs-to-go*)
                     stxs-deferred)]
-             [(head:#%begin-for-syntax ~! d ...)
-              #:with (#%plain-module-begin (begin-for-syntax d- ...))
-              (local-expand #'(#%plain-module-begin (begin-for-syntax d ...)) 'module-begin '())
-              (loop stxs-to-go* (cons (datum->syntax this-syntax
-                                                     (cons #'head (attribute d-))
-                                                     this-syntax
-                                                     this-syntax)
-                                      stxs-deferred))]
-             [({~or #%define-type}
-               ~! . _)
-              (error "not yet implemented")]
-             [({~or #%provide #%define-main} ~! . _)
-              (loop stxs-to-go* (cons this-syntax stxs-deferred))]
              [_
-              (loop (cons (macro-track-origin (apply-as-transformer system-f-decl sc this-syntax)
-                                              this-syntax)
-                          stxs-to-go*)
-                    stxs-deferred)])])))
+              (raise-invalid-thing-error "declaration" this-syntax)])])))
 
-    (define (do-expand-exprs stxs)
+    (define (do-pass-2 stxs)
       (define-values [expanded-decls main-decls]
         (for/fold ([expanded-decls '()]
                    [main-decls '()])
                   ([stx (in-list stxs)])
           (syntax-parse stx
-            #:literal-sets [core-decl-literals]
+            #:literals [#%define-main]
             #:datum-literals [:]
-            [({~or #%require #%define-syntax #%begin-for-syntax} ~! . _)
-             ; already handled in first pass
-             (values (cons this-syntax expanded-decls) main-decls)]
-            [(head:#%provide ~! ps ...)
-             #:do [(define expanded-pss (append-map (lambda (ps) (expand-system-f-provide-spec ps sc))
-                                                    (attribute ps)))]
-             (values (cons (datum->syntax this-syntax
-                                          (cons #'head expanded-pss)
-                                          this-syntax
-                                          this-syntax)
-                           expanded-decls)
-                     main-decls)]
-            [(head:#%define ~! x:id : t:type e:expr)
-             #:do [(define e- (e+t-e/t=! (expand-expr #'e sc) #'t sc #:src #'e))]
-             (values (cons (datum->syntax this-syntax
-                                          (list #'head #'x ': #'t e-)
-                                          this-syntax
-                                          this-syntax)
-                           expanded-decls)
-                     main-decls)]
+            [{~var core (core-decl-pass-2 sc)}
+              (values (cons (attribute core.value) expanded-decls) main-decls)]
             [(head:#%define-main ~! e:expr)
              #:do [(define e- (e+t-e (expand-expr #'e sc)))]
              (values (cons (datum->syntax this-syntax
@@ -404,7 +361,7 @@
         (raise-syntax-error 'system-f "multiple main declarations" #f #f (reverse main-decls)))
       (reverse expanded-decls))
 
-    (do-expand-exprs (do-initial-defs+requires-pass stxs)))
+    (do-pass-2 (do-pass-1 stxs)))
 
   (define-syntax-class system-f-literal
     #:description #f
@@ -413,98 +370,37 @@
     [pattern _:exact-integer]
     [pattern _:string])
 
-  (define (expand-expr stx sc)
+  (define (expand-expr stx [sc #f])
     (define (recur stx) (expand-expr stx sc))
     (syntax-parse stx
-      #:literal-sets [core-expr-literals]
       #:datum-literals [:]
+      [{~var core (core-expr sc)}
+       (attribute core.value)]
+      [{~or {~var transformer (expr-id-transformer sc)}
+            {~var transformer (expr-transformer sc)}}
+       (recur (macro-track-origin (attribute transformer.value) this-syntax))]
       [{~var x (var-id sc)}
        (e+t this-syntax (attribute x.type))]
-      [(#%system-f:datum ~! lit:system-f-literal)
-       (e+t this-syntax (match (syntax-e #'lit)
-                          [(? exact-integer?) #'Integer]
-                          [(? string?) #'String]))]
       [lit:system-f-literal
        (recur (datum->syntax this-syntax
-                             (list (datum->syntax #'here '#%system-f:datum) #'lit)
+                             (list (datum->syntax #'here 'system-f:#%datum) #'lit)
                              this-syntax))]
-      [(head:#%system-f:app ~! f:expr e:expr)
-       ; TODO: share code with type application and kindchecking type ctor application
-       #:do [(match-define (e+t f- f-t) (recur #'f))
-             (define-values [e-t r-t]
-               (syntax-parse f-t
-                 #:literal-sets [core-type-literals]
-                 #:literals [->]
-                 [(#%type:app (#%type:app -> e-t:type) r-t:type)
-                  (values #'e-t #'r-t)]
-                 [_
-                  (raise-syntax-error
-                   'system-f "cannot apply a value that is not a function" this-syntax #'f '()
-                   (~a "\n  expected type: ((-> t1) t2)\n  actual type: " (type->string f-t)))]))]
-       (e+t (datum->syntax this-syntax
-                           (list #'head f- (e+t-e/t=! (recur #'e) e-t sc #:src #'e))
-                           this-syntax
-                           this-syntax)
-            r-t)]
-      [(head:#%lambda ~! [x:id : {~type t:type}] e:expr)
-       #:do [(define sc* (make-expression-scope sc))
-             (define t- (e+t-e/t=! (expand-type #'t sc) #'Type sc #:src #'t))
-             (define x- (scope-bind! sc* #'x (make-local-var t-)))
-             (match-define (e+t e- e-t) (expand-expr (in-scope sc* #'e) sc*))]
-       (e+t (datum->syntax this-syntax
-                           (list #'head (list x- ': t-) e-)
-                           this-syntax
-                           this-syntax)
-            #`(#%type:app (#%type:app -> #,t-) #,e-t))]
-      [(head:#%App ~! e:expr {~type t:expr})
-       #:do [(match-define (e+t e- e-t) (recur #'e))
-             (define-values [x x-k unquantified-t]
-               (syntax-parse e-t
-                 #:literal-sets [core-type-literals]
-                 #:literals [->]
-                 [(#%forall ~! [x:id : x-k:type] unquantified-t:type)
-                  (values #'x #'x-k #'unquantified-t)]
-                 [_
-                  (raise-syntax-error
-                   'system-f "cannot apply a value with a monomorphic type to a type"
-                   this-syntax #'e '()
-                   (~a "\n  expected type: (forall [x : k] t)\n  actual type: "
-                       (type->string e-t)))]))
-             (define t- (e+t-e/t=! (expand-type #'t sc) x-k sc #:src #'t))
-             (define sc* (make-expression-scope sc))
-             (scope-bind! sc* x (generics #:property prop:id-only? #t
-                                          [system-f-type (make-substituting-transformer t-)]))
-             (define instantiated-t (e+t-e (expand-type (in-scope sc* unquantified-t) sc*)))]
-       (e+t (datum->syntax this-syntax
-                           (list #'head e- t-)
-                           this-syntax
-                           this-syntax)
-            instantiated-t)]
-      [(head:#%Lambda ~! [{~type x:id} : {~type k:type}] e:expr)
-       #:do [(define sc* (make-expression-scope sc))
-             (define k- (e+t-e/t=! (expand-type #'k sc) #'Type sc #:src #'k))
-             (define x- (scope-bind! sc* #'x (make-type-var k-)))
-             (match-define (e+t e- e-t) (expand-expr (in-scope sc* #'e) sc*))]
-       (e+t (datum->syntax this-syntax
-                           (list #'head (list x- ': k-) e-)
-                           this-syntax
-                           this-syntax)
-            #`(#%forall [#,x- : #,k-] #,e-t))]
-      [(#%case ~! . _)
-       (error "not implemented yet")]
       [(_ . _)
-       #:when (or (not (system-f-expr? this-syntax sc))
-                  (id-only? this-syntax sc))
        (recur (datum->syntax this-syntax
-                             (cons (datum->syntax #'here '#%system-f:app) this-syntax)
+                             (cons (datum->syntax #'here 'system-f:#%app) this-syntax)
                              this-syntax))]
       [_
-       (recur (macro-track-origin (apply-as-transformer system-f-expr sc this-syntax) this-syntax))]))
+       (raise-invalid-thing-error "expression" this-syntax)]))
 
-  (define (expand-type stx sc)
+  (define (expand-type stx [sc #f])
     (define (recur stx) (expand-type stx sc))
     (syntax-parse stx
       #:literal-sets [core-type-literals]
+      [{~var core (core-type sc)}
+       (attribute core.value)]
+      [{~or {~var transformer (type-id-transformer sc)}
+            {~var transformer (type-transformer sc)}}
+       (recur (macro-track-origin (attribute transformer.value) this-syntax))]
       [{~var x (type-var-id sc)}
        (e+t this-syntax (attribute x.kind))]
       [{~var x (type-constructor-id sc)}
@@ -537,14 +433,11 @@
                            this-syntax)
             t-k)]
       [(_ . _)
-       #:when (or (not (system-f-type? this-syntax sc))
-                  (id-only? this-syntax sc))
        (recur (datum->syntax this-syntax
                              (cons (datum->syntax #'here '#%type:app) this-syntax)
                              this-syntax))]
       [_
-       (recur (macro-track-origin (apply-as-transformer system-f-type sc this-syntax)
-                                  this-syntax))]))
+       (raise-invalid-thing-error "type" this-syntax)]))
 
   (define (shift-phase phase shift)
     (and phase shift (+ phase shift)))
@@ -562,11 +455,15 @@
                              #:from {~or ns-key:id #f} #:in mod-path:module-path
                              => internal-id:id #:at internal-phase:phase-level)])
 
-  (define (expand-system-f-require-spec stx sc)
+  (define (expand-system-f-require-spec stx [sc #f])
     (define (recur stx) (expand-system-f-require-spec stx sc))
     (syntax-parse stx
       #:literal-sets [core-require-spec-literals]
       #:datum-literals [=>]
+      [{~var core (core-require-spec sc)}
+       (attribute core.value)]
+      [{~var core (require-spec-transformer sc)}
+       (recur (macro-track-origin (attribute core.value) this-syntax))]
       [mod-path:module-path
        #:and ~!
        #:do [(define nss (module-exported-namespaces (syntax->datum #'mod-path)))]
@@ -597,8 +494,7 @@
                    [expanded-rs (in-list (recur rs))])
          (macro-track-origin expanded-rs this-syntax))]
       [_
-       (recur (macro-track-origin (apply-as-transformer system-f-require-spec sc this-syntax)
-                                  this-syntax))]))
+       (raise-invalid-thing-error "require spec" this-syntax)]))
 
   (define (local-expand-system-f-require-spec stx [sc #f])
     (datum->syntax #f (cons (datum->syntax #'here '#%union) (expand-system-f-require-spec stx sc))))
@@ -612,11 +508,15 @@
     [pattern (head:#%binding ~! internal-id:id => external-id:id
                              #:at phase:phase-level #:in {~or ns-key:id #f})])
 
-  (define (expand-system-f-provide-spec stx sc)
+  (define (expand-system-f-provide-spec stx [sc #f])
     (define (recur stx) (expand-system-f-provide-spec stx sc))
     (syntax-parse stx
       #:literal-sets [core-provide-spec-literals]
       #:datum-literals [=>]
+      [{~var core (core-provide-spec sc)}
+       (attribute core.value)]
+      [{~var core (provide-spec-transformer sc)}
+       (recur (macro-track-origin (attribute core.value) this-syntax))]
       [x:id
        (list (datum->syntax #f
                             (list (datum->syntax #'here '#%binding)
@@ -628,15 +528,206 @@
                    [expanded-ps (in-list (recur ps))])
          (macro-track-origin expanded-ps this-syntax))]
       [_
-       (recur (macro-track-origin (apply-as-transformer system-f-provide-spec sc this-syntax)
-                                  this-syntax))]))
+       (raise-invalid-thing-error "provide spec" this-syntax)]))
 
   (define (local-expand-system-f-provide-spec stx [sc #f])
     (datum->syntax #f (cons (datum->syntax #'here '#%union) (expand-system-f-provide-spec stx sc)))))
 
+;; ---------------------------------------------------------------------------------------------------
+;; core decls
+
+(define-syntax #%require
+  (generics
+   [core-decl-pass-2 values]
+   [core-decl->racket-decl
+    ; requires are lifted during expansion, so we don’t need to do anything with them here
+    (lambda (stx internal-introduce) #'(begin))]))
+
+(define-syntax #%provide
+  (generics/parse
+   (head ps ...)
+   [(core-decl-pass-1 sc) this-syntax]
+   [(core-decl-pass-2)
+    #:do [(define expanded-pss (append-map expand-system-f-provide-spec (attribute ps)))]
+    (datum->syntax this-syntax
+                   (cons #'head expanded-pss)
+                   this-syntax
+                   this-syntax)]
+   [(core-decl->racket-decl internal-introduce)
+    #`(begin #,@(map system-f-provide-spec->racket-decl (attribute ps)))]))
+
+(define-syntax #%define
+  (generics/parse
+   #:datum-literals [:]
+   (head x:id : t:type e:expr)
+   [(core-decl-pass-1 sc)
+    #:do [(define t- (e+t-e/t=! (expand-type (in-type-namespace #'t)) #'Type #:src #'t))
+          (define x- (scope-bind! sc #'x (make-local-var t-)))]
+    (datum->syntax this-syntax
+                   (list #'head x- ': t- #'e)
+                   this-syntax
+                   this-syntax)]
+   [(core-decl-pass-2)
+    #:do [(define e- (e+t-e/t=! (expand-expr #'e) #'t #:src #'e))]
+    (datum->syntax this-syntax
+                   (list #'head #'x ': #'t e-)
+                   this-syntax
+                   this-syntax)]
+   [(core-decl->racket-decl internal-introduce)
+    #:with internal-x (internal-introduce #'x)
+    #`(begin
+        (define internal-x #,(~> (extract-racket-expr (internal-introduce #'e))
+                                 (syntax-track-residual (system-f-type->residual #'t))))
+        (define-syntax x (make-module-var (quote-syntax/launder t)
+                                          (quote-syntax/launder internal-x))))]))
+
+(define-syntax #%define-syntax
+  (generics/parse
+   (head x:id e)
+   [(core-decl-pass-1 sc)
+    #:with e- (local-transformer-expand #'e 'expression '() (list (scope-defctx sc)))
+    #:with x- (scope-bind! sc #'x #'e-)
+    (datum->syntax this-syntax
+                   (list #'head #'x- #'e-)
+                   this-syntax
+                   this-syntax)]
+   [(core-decl-pass-2) this-syntax]
+   [(core-decl->racket-decl internal-introduce)
+    #`(define-syntax x #,(suspend-expression #'e))]))
+
+(define-syntax #%define-main
+  (generics/parse
+   (_ e:expr)
+   [(core-decl-pass-1 sc) this-syntax]
+   [(core-decl->racket-decl internal-introduce)
+    #`(module* main #f
+        (#%plain-module-begin
+         #,(extract-racket-expr (internal-introduce #'e))))]))
+
+(define-syntax #%begin (generics))
+
+(define-syntax #%begin-for-syntax
+  (generics/parse
+   #:literals [#%plain-module-begin begin-for-syntax]
+   (head d ...)
+   [(core-decl-pass-1 sc)
+    #:with (#%plain-module-begin (begin-for-syntax d- ...))
+    (local-expand #'(#%plain-module-begin (begin-for-syntax d ...)) 'module-begin '())
+    (datum->syntax this-syntax
+                   (cons #'head (attribute d-))
+                   this-syntax
+                   this-syntax)]
+   [(core-decl-pass-2) this-syntax]
+   [(core-decl->racket-decl internal-introduce)
+    #`(begin-for-syntax #,@(map suspend-racket-decl (attribute d)))]))
+
+;; ---------------------------------------------------------------------------------------------------
+;; core exprs
+
+(define-syntax system-f:#%datum
+  (generics/parse
+   (_ lit:system-f-literal)
+   [(core-expr)
+    (e+t this-syntax (match (syntax-e #'lit)
+                       [(? exact-integer?) #'Integer]
+                       [(? string?) #'String]))]
+   [(core-expr->racket-expr)
+    #'(quote lit)]))
+
+(define-syntax system-f:#%app
+  (generics/parse
+   (head f:expr e:expr)
+   [(core-expr)
+    ; TODO: share code with type application and kindchecking type ctor application
+    #:do [(match-define (e+t f- f-t) (expand-expr #'f))
+          (define-values [e-t r-t]
+            (syntax-parse f-t
+              #:literal-sets [core-type-literals]
+              #:literals [->]
+              [(#%type:app (#%type:app -> e-t:type) r-t:type)
+               (values #'e-t #'r-t)]
+              [_
+               (raise-syntax-error
+                'system-f "cannot apply a value that is not a function" this-syntax #'f '()
+                (~a "\n  expected type: ((-> t1) t2)\n  actual type: " (type->string f-t)))]))]
+    (e+t (datum->syntax this-syntax
+                        (list #'head f- (e+t-e/t=! (expand-expr #'e) e-t #:src #'e))
+                        this-syntax
+                        this-syntax)
+         r-t)]
+   [(core-expr->racket-expr)
+    #`(#%plain-app #,(extract-racket-expr #'f) #,(extract-racket-expr #'e))]))
+
+(define-syntax #%lambda
+  (generics/parse
+   (head [x:id : t:type] e:expr)
+   [(core-expr)
+    #:do [(define t- (e+t-e/t=! (expand-type (in-type-namespace #'t)) #'Type #:src #'t))
+          (define sc* (make-expression-scope))
+          (define x- (scope-bind! sc* #'x (make-local-var t-)))
+          (match-define (e+t e- e-t) (expand-expr (in-scope sc* #'e) sc*))]
+    (e+t (datum->syntax this-syntax
+                        (list #'head (list x- ': t-) e-)
+                        this-syntax
+                        this-syntax)
+         #`(#%type:app (#%type:app -> #,t-) #,e-t))]
+   [(core-expr->racket-expr)
+    (~> #`(#%plain-lambda [x] #,(extract-racket-expr #'e))
+        (syntax-track-residual (system-f-type->residual #'t)))]))
+
+(define-syntax #%App
+  (generics/parse
+   (head e:expr t:type)
+   [(core-expr)
+    #:do [(match-define (e+t e- e-t) (expand-expr #'e))
+          (define-values [x x-k unquantified-t]
+            (syntax-parse e-t
+              #:literal-sets [core-type-literals]
+              #:literals [->]
+              [(#%forall ~! [x:id : x-k:type] unquantified-t:type)
+               (values #'x #'x-k #'unquantified-t)]
+              [_
+               (raise-syntax-error
+                'system-f "cannot apply a value with a monomorphic type to a type"
+                this-syntax #'e '()
+                (~a "\n  expected type: (forall [x : k] t)\n  actual type: "
+                    (type->string e-t)))]))
+          (define t- (e+t-e/t=! (expand-type (in-type-namespace #'t)) x-k #:src #'t))
+          (define sc* (make-expression-scope))
+          (scope-bind! sc* x (generics [type-id-transformer (make-substituting-transformer t-)]))
+          (define instantiated-t (e+t-e (expand-type (in-scope sc* unquantified-t) sc*)))]
+    (e+t (datum->syntax this-syntax
+                        (list #'head e- t-)
+                        this-syntax
+                        this-syntax)
+         instantiated-t)]
+   [(core-expr->racket-expr)
+    (~> (extract-racket-expr #'e)
+        (syntax-track-residual (system-f-type->residual #'t)))]))
+
+(define-syntax #%Lambda
+  (generics/parse
+   (head [x:id : k:type] e:expr)
+   [(core-expr)
+    #:do [(define k- (e+t-e/t=! (expand-type (in-type-namespace #'k)) #'Type #:src #'k))
+          (define sc* (make-expression-scope))
+          (define x- (scope-bind! sc* (in-type-namespace #'x) (make-type-var k-)))
+          (match-define (e+t e- e-t) (expand-expr (in-scope sc* #'e) sc*))]
+    (e+t (datum->syntax this-syntax
+                        (list #'head (list x- ': k-) e-)
+                        this-syntax
+                        this-syntax)
+         #`(#%forall [#,x- : #,k-] #,e-t))]
+   [(core-expr->racket-expr)
+    (~> (extract-racket-expr #'e)
+        (syntax-track-residual (make-residual (list (system-f-type->residual #'k))
+                                              #:bindings (list #'x))))]))
+
+;; ---------------------------------------------------------------------------------------------------
+
 (define-syntax system-f:shift
   (generics
-   [system-f-require-spec
+   [require-spec-transformer
     (syntax-parser
       #:literal-sets [core-require-spec-literals]
       [(_ phase-stx:phase-level rs ...)
@@ -651,7 +742,7 @@
                                             '#:at (shift-phase (syntax-e #'b.internal-phase) phase))
                                       b-stx
                                       b-stx)))])]
-   [system-f-provide-spec
+   [provide-spec-transformer
     (syntax-parser
       #:literal-sets [core-provide-spec-literals]
       [(_ phase-stx:phase-level ps ...)
@@ -693,66 +784,18 @@
 ; appropriate references.
 
 (begin-for-syntax
-  (define (system-f-decl->racket-decl stx internal-introduce)
-    (macro-track-origin
-     (syntax-parse stx
-       #:literal-sets [core-decl-literals]
-       #:datum-literals [:]
-       [(#%require ~! . _)
-        ; requires are lifted during expansion, so we don’t need to do anything with them here
-        #'(begin)]
-       [(#%provide ~! ps ...)
-        #`(begin #,@(map system-f-provide-spec->racket-decl (attribute ps)))]
-       [(#%define ~! x:id : t:type e:expr)
-        #:with internal-x (internal-introduce #'x)
-        #`(begin
-            (define internal-x #,(~> (system-f-expr->racket-expr (internal-introduce #'e))
-                                     (syntax-track-residual (system-f-type->residual #'t))))
-            (define-syntax x (make-module-var (quote-syntax/launder t)
-                                              (quote-syntax/launder internal-x))))]
-       [(#%define-syntax ~! x:id e)
-        #`(define-syntax x #,(suspend-expression #'e))]
-       [(#%begin-for-syntax ~! d ...)
-        #`(begin-for-syntax #,@(map suspend-racket-decl (attribute d)))]
-       [(#%define-main ~! e:expr)
-        #`(module* main #f
-            (#%plain-module-begin
-             #,(system-f-expr->racket-expr (internal-introduce #'e))))]
-       [_
-        (raise-syntax-error
-         'system-f
-         "internal error: unexpected declaration form found during extraction to racket"
-         this-syntax)])
-     stx))
+  (define (extract-racket-decl stx internal-introduce)
+    (macro-track-origin (core-decl->racket-decl stx internal-introduce) stx))
 
-  (define (system-f-expr->racket-expr stx)
+  (define (extract-racket-expr stx)
     (macro-track-origin
      (syntax-parse stx
-       #:literal-sets [core-expr-literals]
-       #:datum-literals [:]
        [x:module-var-id
         (attribute x.racket-id)]
        [_:id
         this-syntax]
-       [(#%system-f:datum ~! lit:system-f-literal)
-        #'(#%datum . lit)]
-       [(#%system-f:app ~! f:expr e:expr)
-        #`(#%plain-app #,(system-f-expr->racket-expr #'f) #,(system-f-expr->racket-expr #'e))]
-       [(#%lambda ~! [x:id : t:type] e:expr)
-        (~> #`(#%plain-lambda [x] #,(system-f-expr->racket-expr #'e))
-            (syntax-track-residual (system-f-type->residual #'t)))]
-       [(#%App ~! e:expr t:type)
-        (~> (system-f-expr->racket-expr #'e)
-            (syntax-track-residual (system-f-type->residual #'t)))]
-       [(#%Lambda ~! [x:id : k:type] e:expr)
-        (~> (system-f-expr->racket-expr #'e)
-            (syntax-track-residual (make-residual (list (system-f-type->residual #'k))
-                                                  #:bindings (list #'x))))]
        [_
-        (raise-syntax-error
-         'system-f
-         "internal error: unexpected expression form found during extraction to racket"
-         this-syntax)])
+        (core-expr->racket-expr stx)])
      stx))
 
   (define system-f-type->residual
@@ -815,18 +858,18 @@
 
   (define system-f-debug-print-decl?
     (syntax-parser
-      #:literal-sets [core-decl-literals]
+      #:literals [#%require #%define-syntax #%begin-for-syntax]
       [({~or #%require #%define-syntax #%begin-for-syntax} ~! . _) #f]
       [_ #t])))
 
-(define-syntax #%system-f:module-begin
+(define-syntax system-f:#%module-begin
   (make-namespaced-module-begin #'do-module-begin namespace:value))
 
 (define-syntax-parser do-module-begin
   [(_ decl ...)
    #:with [expanded-decl ...] (expand-module (attribute decl))
    #:do [(println (syntax-local-introduce
-                   #`(#%system-f:module-begin
+                   #`(#%module-begin
                       #,@(filter system-f-debug-print-decl? (attribute expanded-decl)))))]
    #:do [(define internal-introducer (make-syntax-introducer #t))
          (define (internal-introduce stx)
@@ -834,7 +877,7 @@
          (define suspenders (make-suspenders))]
    #:with [racket-decl ...] (parameterize ([current-suspenders suspenders])
                               (for/list ([expanded-decl (in-list (attribute expanded-decl))])
-                                (system-f-decl->racket-decl expanded-decl internal-introduce)))
+                                (extract-racket-decl expanded-decl internal-introduce)))
    ; Add an extra scope to everything to “freshen” binders. The expander complains if an identifier
    ; bound by a module-level binding form has *exactly* the same scopes as an existing binding, since
    ; the new binding would conflict with the old one. By adding a new scope to everything, the
