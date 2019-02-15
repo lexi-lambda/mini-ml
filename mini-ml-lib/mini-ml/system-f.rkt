@@ -45,7 +45,7 @@
          "private/extract.rkt"
          "private/namespace.rkt")
 
-(provide (rename-out [#%system-f:module-begin #%module-begin]))
+(provide (rename-out [system-f:#%module-begin #%module-begin]))
 
 (define-namespace value #:unique)
 (define-namespace type #:unique)
@@ -105,7 +105,7 @@
 (define-keywords
   (decl [#%require #%provide #%define #%define-syntax #%define-type #%define-main #%begin
                    #%begin-for-syntax])
-  (expr [#%system-f:datum #%lambda #%system-f:app #%Lambda #%App #%case])
+  (expr [system-f:#%datum #%lambda system-f:#%app #%Lambda #%App #%case])
   (type [#%type:app #%forall])
   (require-spec [#%binding #%union])
   (provide-spec [#%binding #%union]))
@@ -420,15 +420,19 @@
       #:datum-literals [:]
       [{~var x (var-id sc)}
        (e+t this-syntax (attribute x.type))]
-      [(#%system-f:datum ~! lit:system-f-literal)
+      [(system-f:#%datum ~! lit:system-f-literal)
        (e+t this-syntax (match (syntax-e #'lit)
                           [(? exact-integer?) #'Integer]
                           [(? string?) #'String]))]
       [lit:system-f-literal
        (recur (datum->syntax this-syntax
-                             (list (datum->syntax #'here '#%system-f:datum) #'lit)
+                             (list (make-renamed-identifier #'system-f:#%datum
+                                                            '#%datum
+                                                            #:srcloc #f
+                                                            #:props #f)
+                                   #'lit)
                              this-syntax))]
-      [(head:#%system-f:app ~! f:expr e:expr)
+      [(head:system-f:#%app ~! f:expr e:expr)
        ; TODO: share code with type application and kindchecking type ctor application
        #:do [(match-define (e+t f- f-t) (recur #'f))
              (define-values [e-t r-t]
@@ -496,7 +500,11 @@
        #:when (or (not (system-f-expr? this-syntax sc))
                   (id-only? this-syntax sc))
        (recur (datum->syntax this-syntax
-                             (cons (datum->syntax #'here '#%system-f:app) this-syntax)
+                             (cons (make-renamed-identifier #'system-f:#%app
+                                                            '#%app
+                                                            #:srcloc #f
+                                                            #:props #f)
+                                   this-syntax)
                              this-syntax))]
       [_
        (recur (macro-track-origin (apply-as-transformer system-f-expr sc this-syntax) this-syntax))]))
@@ -734,9 +742,9 @@
         (attribute x.racket-id)]
        [_:id
         this-syntax]
-       [(#%system-f:datum ~! lit:system-f-literal)
+       [(system-f:#%datum ~! lit:system-f-literal)
         #'(#%datum . lit)]
-       [(#%system-f:app ~! f:expr e:expr)
+       [(system-f:#%app ~! f:expr e:expr)
         #`(#%plain-app #,(system-f-expr->racket-expr #'f) #,(system-f-expr->racket-expr #'e))]
        [(#%lambda ~! [x:id : t:type] e:expr)
         (~> #`(#%plain-lambda [x] #,(system-f-expr->racket-expr #'e))
@@ -819,14 +827,14 @@
       [({~or #%require #%define-syntax #%begin-for-syntax} ~! . _) #f]
       [_ #t])))
 
-(define-syntax #%system-f:module-begin
+(define-syntax system-f:#%module-begin
   (make-namespaced-module-begin #'do-module-begin namespace:value))
 
 (define-syntax-parser do-module-begin
   [(_ decl ...)
    #:with [expanded-decl ...] (expand-module (attribute decl))
    #:do [(println (syntax-local-introduce
-                   #`(#%system-f:module-begin
+                   #`(#%module-begin
                       #,@(filter system-f-debug-print-decl? (attribute expanded-decl)))))]
    #:do [(define internal-introducer (make-syntax-introducer #t))
          (define (internal-introduce stx)

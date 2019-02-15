@@ -5,6 +5,7 @@
          racket/match
          syntax/parse
          syntax/parse/define
+         syntax/srcloc
          threading)
 
 (provide (contract-out [module-path-syntax? (-> syntax? boolean?)]
@@ -31,6 +32,11 @@
                                                         any/c
                                                         (-> any/c any/c)
                                                         syntax?)]
+                       [make-renamed-identifier (->* [identifier? symbol?]
+                                                     [#:phase (or/c exact-integer? #f)
+                                                      #:srcloc source-location?
+                                                      #:props (or/c syntax? #f)]
+                                                     identifier?)]
                        [derived-id (-> string? syntax? string? syntax?)]
                        [macro-track-origin (->* [syntax? syntax?] [#:flip-scopes? any/c] syntax?)]
                        [introduce-everywhere (-> syntax? (-> syntax? syntax?) syntax?)])
@@ -136,6 +142,36 @@
              [a a])
            (datum->syntax disarmed _ disarmed disarmed)
            (adjust-property key proc))))))
+
+;; ---------------------------------------------------------------------------------------------------
+;; syntax binding sets
+
+; A small wrapper around `syntax-binding-set-extend` and `identifier-binding` to make it possible to
+; create an identifier with the same binding as another binding but with an arbitrary name.
+(define (make-renamed-identifier internal-id external-sym
+                                 #:phase [phase (syntax-local-phase-level)]
+                                 #:srcloc [srcloc internal-id]
+                                 #:props [props internal-id])
+  (match (identifier-binding internal-id phase)
+    [(list source-mod source-sym nominal-source-mod nominal-source-sym
+           source-phase import-phase nominal-export-phase)
+     (define binding-set (syntax-binding-set-extend (syntax-binding-set)
+                                                    external-sym
+                                                    phase
+                                                    source-mod
+                                                    #:source-symbol source-sym
+                                                    #:source-phase source-phase
+                                                    #:nominal-module nominal-source-mod
+                                                    #:nominal-phase nominal-export-phase
+                                                    #:nominal-symbol nominal-source-sym
+                                                    #:nominal-require-phase import-phase))
+     (define binding-stx (syntax-binding-set->syntax binding-set #f))
+     (datum->syntax binding-stx external-sym (build-source-location-vector srcloc) props)]
+    [other-binding
+     (raise-arguments-error 'identifier->syntax-binding-set
+                            "identifier is not bound to a module-level binding"
+                            "identifier" internal-id
+                            "binding" other-binding)]))
 
 ;; ---------------------------------------------------------------------------------------------------
 ;; cooperating with check syntax
